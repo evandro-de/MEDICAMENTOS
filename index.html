@@ -632,6 +632,14 @@ function App() {
       setCurrais(curR ? safeJsonParse(curR.value, []) : []);
       setUsuarios(usrR ? safeJsonParse(usrR.value, []) : []);
 
+      // Nas atualizações automáticas em segundo plano (silent), pulamos a
+      // releitura dos blocos de animais: eles são grandes e re-lê-los a
+      // cada 45s consumiria a cota gratuita de leituras do Firestore rápido
+      // demais. O banco de SISBOV só é recarregado na abertura do app ou no
+      // botão "Atualizar" manual.
+      if (silent) {
+        // nada a fazer aqui — animaisMap/animaisUpdatedAt permanecem como estão
+      } else {
       const animIdxR = await window.storage.get("cfg:animais_index", true).catch(() => null);
       if (animIdxR) {
         try {
@@ -652,6 +660,7 @@ function App() {
       } else {
         setAnimaisMap({});
         setAnimaisUpdatedAt(null);
+      }
       }
 
       const idx = await window.storage.list("lanc:", true).catch(() => null);
@@ -778,7 +787,8 @@ function App() {
         setAnimaisUpdatedAt(null);
         showToast("Nenhum animal cadastrado ainda.");
       }
-    } catch {
+    } catch (e) {
+      console.error("Falha ao atualizar banco de animais:", e);
       showToast("Falha ao atualizar o banco de dados.", "err");
     } finally {
       setAnimaisSyncing(false);
@@ -811,7 +821,8 @@ function App() {
       setAnimaisMap(fresh);
       setAnimaisUpdatedAt(meta.updatedAt);
       showToast(`Banco de dados substituído: ${entries.length} animal(is) na versão atual.`);
-    } catch {
+    } catch (e) {
+      console.error("Falha ao importar animais:", e);
       showToast("Falha ao importar os animais.", "err");
     } finally {
       setAnimaisSyncing(false);
