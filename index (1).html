@@ -1,0 +1,2721 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Controle de Medicamentos</title>
+<!--
+  CSP (item 1 do pedido de segurança):
+  - script-src: só permite scripts locais e o CDN oficial (cdnjs) de onde vêm
+    React/ReactDOM/Babel. 'unsafe-inline' é necessário aqui porque o Babel
+    Standalone compila o JSX no navegador e injeta o resultado como um
+    <script> gerado dinamicamente — sem isso, o app não roda. Isso é uma
+    concessão conhecida da arquitetura "JSX compilado no navegador"; o jeito
+    de eliminar de vez essa permissão seria pré-compilar o JSX (build step)
+    antes de publicar, deixando só JS puro no arquivo final.
+  - connect-src 'self': não fazemos nenhuma chamada fetch/XHR para API
+    externa — os dados vêm do armazenamento compartilhado da própria
+    plataforma (via Firebase Firestore, com login anônimo obrigatório).
+    Por isso não há placeholder de URL de API para você substituir aqui.
+  - object-src/base-uri/frame-ancestors bloqueados: reduz superfície para
+    plugins, sequestro de <base> e clickjacking.
+  Observação: como este arquivo roda como página publicada da Claude, a
+  plataforma já impõe a própria política de segurança por cima desta (só
+  libera scripts de um conjunto fixo de CDNs). Esta tag é uma camada extra,
+  documentada e explícita, não a única linha de defesa.
+-->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://www.gstatic.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self' https://*.googleapis.com https://*.firebaseio.com; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self';" />
+<style>
+  :root {
+    --bg: #F3F4EC;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --bg: #F3F4EC; }
+  }
+  :root[data-theme="dark"] { --bg: #F3F4EC; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    box-sizing: border-box;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    height: 100%;
+  }
+  * { box-sizing: border-box; }
+  #root { min-height: 100%; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .spin { display: inline-block; animation: spin 1s linear infinite; }
+</style>
+</head>
+<body>
+<div id="root">
+  <div style="display:flex;align-items:center;justify-content:center;height:100vh;font-family:system-ui,-apple-system,sans-serif;color:#6B6A57;">
+    Carregando…
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useCallback, useMemo } = React;
+
+// ---------- Ícones (substituem lucide-react por glifos leves, mesma API) ----------
+function IconBase(glyph) {
+  return function ({ size = 16, color, style }) {
+    return (
+      <span
+        className={glyph === "↻" ? undefined : undefined}
+        style={{ fontSize: size, lineHeight: 1, display: "inline-flex", alignItems: "center", justifyContent: "center", width: size, height: size, color, ...style }}
+      >
+        {glyph}
+      </span>
+    );
+  };
+}
+const Syringe = IconBase("💉");
+const ClipboardList = IconBase("📋");
+const Settings = IconBase("⚙️");
+const Plus = IconBase("+");
+const X = IconBase("✕");
+const Search = IconBase("🔍");
+const Trash2 = IconBase("🗑️");
+const ChevronDown = IconBase("▾");
+const ChevronUp = IconBase("▴");
+const Thermometer = IconBase("🌡️");
+const Weight = IconBase("⚖️");
+const User = IconBase("👤");
+const MessageSquare = IconBase("💬");
+const Calendar = IconBase("📅");
+const MapPin = IconBase("📍");
+const AlertCircle = IconBase("⚠️");
+const Check = IconBase("✓");
+const Loader2 = IconBase("↻");
+const RefreshCw = IconBase("↻");
+const FileUp = IconBase("⬆️");
+const FileDown = IconBase("⬇️");
+const UserCircle2 = IconBase("👤");
+const LogOut = IconBase("↩");
+const KeyRound = IconBase("🔑");
+const Pencil = IconBase("✏️");
+
+// ============================================================
+// CONFIGURAÇÃO DO FIREBASE — troque pelos valores do SEU projeto
+// (Console do Firebase > Configurações do projeto > Seus apps > Web).
+// Esses valores NÃO são secretos: é normal e seguro eles ficarem
+// visíveis no código público do GitHub. Quem protege os dados de
+// verdade são as REGRAS de segurança do Firestore + login exigido
+// (veja o README.md do pacote para o passo a passo completo).
+// ============================================================
+const firebaseConfig = {
+  apiKey: "AIzaSyCQxBD7_a1FUd8EiqW1d2WzVVlsWDprEHQ",
+  authDomain: "medicamentos-b52bc.firebaseapp.com",
+  projectId: "medicamentos-b52bc",
+  storageBucket: "medicamentos-b52bc.firebasestorage.app",
+  messagingSenderId: "470117379538",
+  appId: "1:470117379538:web:b40fc57fdee54868176c0b",
+};
+
+// ---------- Camada de armazenamento (agora sobre o Firebase Firestore — mesma API do window.storage) ----------
+function keyToDocPath(key) {
+  if (key.startsWith("cfg:")) return "config/" + key.slice(4);
+  if (key.startsWith("animais:chunk:")) return "animais/chunk_" + key.slice("animais:chunk:".length);
+  if (key.startsWith("lanc:")) return "lancamentos/" + key.slice(5);
+  return "misc/" + key.replace(/[^a-zA-Z0-9_-]/g, "_");
+}
+function makeStorageShim(firestore) {
+  return {
+    async get(key) {
+      const snap = await firestore.doc(keyToDocPath(key)).get();
+      if (!snap.exists) return null;
+      const data = snap.data();
+      return { key, value: data && data.value, shared: true };
+    },
+    async set(key, value) {
+      await firestore.doc(keyToDocPath(key)).set({ value });
+      return { key, value, shared: true };
+    },
+    async delete(key) {
+      await firestore.doc(keyToDocPath(key)).delete();
+      return { key, deleted: true, shared: true };
+    },
+    async list(prefix) {
+      if (prefix === "lanc:") {
+        const snap = await firestore.collection("lancamentos").get();
+        return { keys: snap.docs.map((d) => "lanc:" + d.id), prefix, shared: true };
+      }
+      return { keys: [], prefix, shared: true };
+    },
+  };
+}
+
+const SEED_MEDICAMENTOS = [
+  { nome: "AGROVET PLUS", lotes: ["18"] },
+  { nome: "ANABOLIC", lotes: ["1"] },
+  { nome: "ANASEDAN", lotes: ["16"] },
+  { nome: "ANESTESICO L", lotes: ["13"] },
+  { nome: "AZIUM", lotes: ["2"] },
+  { nome: "BANAMINE", lotes: ["25"] },
+  { nome: "BIOXAN", lotes: ["23"] },
+  { nome: "BIOXELL", lotes: ["1"] },
+  { nome: "BLO-TROL", lotes: ["21"] },
+  { nome: "BORGAL", lotes: ["14"] },
+  { nome: "COBACTAN", lotes: ["1"] },
+  { nome: "CORTIFLAN", lotes: ["21"] },
+  { nome: "DRAXXIN", lotes: ["2"] },
+  { nome: "FLUCORTAN", lotes: ["1"] },
+  { nome: "GANASEG", lotes: ["31"] },
+  { nome: "HEPATOXAN", lotes: ["30"] },
+  { nome: "INDIGEST", lotes: ["26"] },
+  { nome: "KINETOMAX", lotes: ["23"] },
+  { nome: "MEGACILIN PPU PLUS", lotes: ["1"] },
+  { nome: "MICOTIL 300", lotes: ["26"] },
+  { nome: "MONOVIN B1", lotes: ["25"] },
+  { nome: "MONOVIN K", lotes: ["20"] },
+  { nome: "NIGLUMINE", lotes: ["28"] },
+  { nome: "OXITRAT LA PLUS", lotes: ["1"] },
+  { nome: "PÉ DE LÚVIO", lotes: [] },
+  { nome: "PENCIVET PLUS", lotes: ["23"] },
+  { nome: "PENTABIOTICO REFORCADO", lotes: ["1"] },
+  { nome: "POLI-STAR", lotes: ["0"] },
+  { nome: "PRO RUMEN", lotes: ["1"] },
+  { nome: "R-COCHO", lotes: [] },
+  { nome: "RESFLOR GOLD", lotes: ["21"] },
+  { nome: "RESOLUTOR", lotes: ["24"] },
+  { nome: "SOMENTENTE TRANSFERENCIA", lotes: [] },
+  { nome: "TERRAMICINA", lotes: ["15"] },
+  { nome: "TETRAPEN PPU", lotes: ["1"] },
+  { nome: "TULAXX", lotes: ["1"] },
+  { nome: "TUMOR", lotes: [] },
+  { nome: "VALLEECALCIO", lotes: ["1"] },
+  { nome: "VALLEECÁLCIO", lotes: ["1"] },
+  { nome: "VERRUTRAT", lotes: ["0"] },
+  { nome: "VILOCCI", lotes: ["1"] },
+  { nome: "VIVAZENE", lotes: ["1"] },
+  { nome: "XILAZIN", lotes: ["14"] },
+  { nome: "ZELERIS", lotes: ["1"] },
+  { nome: "ZUPREVO", lotes: ["25"] },
+];
+
+const SEED_MOTIVOS = [
+  "ABCESSO", "CASCO", "COLICA", "CORTE", "EMPANZINADO", "EXTRACAO DE UNHA",
+  "FRAQUEZA", "INFLAMACAO", "LESAO", "LESAO CARRETA", "PNEUMONIA",
+  "POLIENCEFALOMALACIA", "PREVENCAO", "TIMPANISMO", "TRAVADO",
+  "T-SEM MEDICAMENTO", "TUMOR", "VERRUGA", "INTOXICACAO", "TRISTEZA",
+  "ENTEROTOXEMIA", "DIARREIA", "ACROBUSTITE", "REFUGO DE COCHO",
+];
+
+// Item 3 (tratamento robusto de respostas inesperadas): faz o parse de um
+// registro isoladamente. Se um único campo vier corrompido/adulterado no
+// armazenamento compartilhado, ele cai no valor padrão em vez de travar o
+// carregamento dos outros campos ou quebrar a tela.
+function safeJsonParse(str, fallback) {
+  if (typeof str !== "string") return fallback;
+  try {
+    return JSON.parse(str);
+  } catch {
+    return fallback;
+  }
+}
+
+// Item 4 (armazenamento seguro): nunca guardamos a senha em texto puro —
+// nem no localStorage (que não usamos em nenhum lugar do app) nem no banco
+// compartilhado. Só o hash SHA-256 é persistido; a senha digitada só existe
+// em memória, no escopo da função, pelo tempo do cálculo do hash.
+async function hashPin(pin) {
+  const enc = new TextEncoder().encode(pin);
+  const buf = await crypto.subtle.digest("SHA-256", enc);
+  return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+const uid = () => `${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+const todayStr = () => new Date().toISOString().slice(0, 10);
+const fmtDate = (iso) => {
+  if (!iso) return "";
+  const [y, m, d] = iso.split("-");
+  return `${d}/${m}/${y}`;
+};
+const fmtDateTime = (ts) => {
+  const d = new Date(ts);
+  return d.toLocaleString("pt-BR", { day: "2-digit", month: "2-digit", year: "2-digit", hour: "2-digit", minute: "2-digit" });
+};
+
+function detectDelimiter(line) {
+  const candidates = [";", ",", "\t"];
+  let best = ",";
+  let bestCount = -1;
+  candidates.forEach((d) => {
+    const count = line.split(d).length - 1;
+    if (count > bestCount) {
+      bestCount = count;
+      best = d;
+    }
+  });
+  return best;
+}
+
+function splitCsvLine(line, delim) {
+  const result = [];
+  let cur = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        cur += '"';
+        i++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if (ch === delim && !inQuotes) {
+      result.push(cur);
+      cur = "";
+    } else {
+      cur += ch;
+    }
+  }
+  result.push(cur);
+  return result.map((s) => s.trim());
+}
+
+function normalizeHeader(h) {
+  return h
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9_]/g, "");
+}
+
+function parseAnimaisCsv(text) {
+  const lines = text.split(/\r\n|\n|\r/).filter((l) => l.trim().length > 0);
+  if (lines.length === 0) return { rows: [], error: "Arquivo vazio." };
+
+  const delim = detectDelimiter(lines[0]);
+  const headerCells = splitCsvLine(lines[0], delim).map(normalizeHeader);
+  const looksLikeBigExport = headerCells.length > 44;
+  const sisbovIdx = headerCells.findIndex((h) => h === "sisbov");
+
+  let dataLines = lines;
+  let sIdx = 0;
+  let cIdx = 1;
+
+  if (sisbovIdx !== -1) {
+    sIdx = sisbovIdx;
+    if (looksLikeBigExport) {
+      cIdx = 44;
+    } else {
+      cIdx = headerCells.findIndex((h) => h === "local_atual" || h === "curral" || h === "curral_atual");
+    }
+    dataLines = lines.slice(1);
+  } else if (looksLikeBigExport) {
+    sIdx = 3;
+    cIdx = 44;
+    dataLines = lines.slice(1);
+  }
+
+  const rows = [];
+  dataLines.forEach((line) => {
+    const cells = splitCsvLine(line, delim);
+    const sisbov = (cells[sIdx] || "").replace(/\D/g, "");
+    if (!sisbov) return;
+    const curral = cIdx !== -1 && cells[cIdx] ? cells[cIdx].trim().toUpperCase() : null;
+    rows.push({ sisbov, curral: curral || null });
+  });
+
+  return { rows, error: rows.length === 0 ? "Não encontrei nenhum SISBOV válido no conteúdo." : null };
+}
+
+const EAR_TAG_CLIP = "polygon(0% 0%, 88% 0%, 100% 50%, 88% 100%, 0% 100%)";
+
+function EarTag({ children, tone = "amber" }) {
+  const tones = {
+    amber: { bg: "#F3C15E", fg: "#5B3A0A" },
+    green: { bg: "#9CC48A", fg: "#233E17" },
+    gray: { bg: "#D9D6C6", fg: "#38352A" },
+  };
+  const c = tones[tone] || tones.amber;
+  return (
+    <span
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        background: c.bg,
+        color: c.fg,
+        fontWeight: 700,
+        fontSize: 12,
+        letterSpacing: "0.02em",
+        padding: "4px 14px 4px 8px",
+        clipPath: EAR_TAG_CLIP,
+        fontVariantNumeric: "tabular-nums",
+        whiteSpace: "nowrap",
+      }}
+    >
+      {children}
+    </span>
+  );
+}
+
+function Field({ label, required, children, hint }) {
+  return (
+    <label style={{ display: "block", marginBottom: 14 }}>
+      <div style={{ fontSize: 12, fontWeight: 700, color: "#4A4E3F", textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 5 }}>
+        {label} {required && <span style={{ color: "#B5442E" }}>*</span>}
+      </div>
+      {children}
+      {hint && <div style={{ fontSize: 11.5, color: "#8B8A78", marginTop: 3 }}>{hint}</div>}
+    </label>
+  );
+}
+
+const inputBase = {
+  width: "100%",
+  boxSizing: "border-box",
+  border: "1.5px solid #D7D5C4",
+  borderRadius: 10,
+  padding: "11px 12px",
+  fontSize: 15,
+  background: "#FFFFFF",
+  color: "#20241A",
+  outline: "none",
+  fontFamily: "inherit",
+};
+
+function TextInput(props) {
+  return <input {...props} style={{ ...inputBase, ...(props.style || {}) }} />;
+}
+function Select(props) {
+  return (
+    <select {...props} style={{ ...inputBase, ...(props.style || {}), appearance: "none", backgroundImage: "none" }}>
+      {props.children}
+    </select>
+  );
+}
+function TextArea(props) {
+  return <textarea {...props} style={{ ...inputBase, resize: "vertical", minHeight: 70, ...(props.style || {}) }} />;
+}
+
+function Btn({ children, onClick, variant = "primary", style, disabled, type = "button" }) {
+  const variants = {
+    primary: { background: "#2E4A2B", color: "#F3F4EC", border: "1.5px solid #2E4A2B" },
+    accent: { background: "#D98F1F", color: "#3A2500", border: "1.5px solid #D98F1F" },
+    ghost: { background: "transparent", color: "#2E4A2B", border: "1.5px solid #C8C6B4" },
+    danger: { background: "transparent", color: "#B5442E", border: "1.5px solid #E4C4BC" },
+  };
+  return (
+    <button
+      type={type}
+      onClick={onClick}
+      disabled={disabled}
+      style={{
+        ...variants[variant],
+        borderRadius: 10,
+        padding: "11px 16px",
+        fontSize: 14.5,
+        fontWeight: 700,
+        cursor: disabled ? "default" : "pointer",
+        opacity: disabled ? 0.55 : 1,
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        gap: 6,
+        fontFamily: "inherit",
+        ...style,
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+function Card({ children, style }) {
+  return (
+    <div
+      style={{
+        background: "#FFFFFF",
+        border: "1px solid #E3E1D3",
+        borderRadius: 14,
+        padding: "16px 16px",
+        ...style,
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+function SectionTitle({ children }) {
+  return (
+    <div
+      style={{
+        fontSize: 11.5,
+        fontWeight: 800,
+        color: "#6B6A57",
+        textTransform: "uppercase",
+        letterSpacing: "0.08em",
+        margin: "22px 0 10px",
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+const errStyle = { borderColor: "#D98C77", background: "#FBF0EC" };
+
+function LoginScreen({ usuarios, onLogin }) {
+  const [selected, setSelected] = useState(null);
+  const [senha, setSenha] = useState("");
+  const [error, setError] = useState("");
+
+  const tryLogin = async () => {
+    if (!selected) return;
+    const digitedHash = await hashPin(senha);
+    if (digitedHash === selected.senhaHash) {
+      onLogin(selected.nome);
+    } else {
+      setError("Senha incorreta.");
+      setSenha("");
+    }
+  };
+
+  return (
+    <div
+      style={{
+        fontFamily: "system-ui, -apple-system, 'Segoe UI', sans-serif",
+        background: "#F3F4EC",
+        minHeight: 640,
+        maxWidth: 460,
+        margin: "0 auto",
+        borderRadius: 18,
+        overflow: "hidden",
+        border: "1px solid #E3E1D3",
+        display: "flex",
+        flexDirection: "column",
+      }}
+    >
+      <div style={{ background: "#2E4A2B", padding: "20px 18px", color: "#F3F4EC" }}>
+        <div style={{ fontSize: 18, fontWeight: 800 }}>Controle de Medicamentos</div>
+        <div style={{ fontSize: 12, color: "#B9C8AE", marginTop: 2 }}>Identifique-se para começar</div>
+      </div>
+
+      <div style={{ flex: 1, padding: 20 }}>
+        {!selected ? (
+          <>
+            <div style={{ fontSize: 12, fontWeight: 800, color: "#6B6A57", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 12 }}>
+              Quem está aplicando?
+            </div>
+            {usuarios.map((u) => (
+              <button
+                key={u.nome}
+                onClick={() => {
+                  setSelected(u);
+                  setError("");
+                  setSenha("");
+                }}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 10,
+                  width: "100%",
+                  boxSizing: "border-box",
+                  background: "#FFFFFF",
+                  border: "1px solid #E3E1D3",
+                  borderRadius: 12,
+                  padding: "14px 14px",
+                  marginBottom: 8,
+                  cursor: "pointer",
+                  fontFamily: "inherit",
+                  textAlign: "left",
+                }}
+              >
+                <UserCircle2 size={22} color="#2E4A2B" />
+                <span style={{ fontSize: 15, fontWeight: 700, color: "#20241A" }}>{u.nome}</span>
+              </button>
+            ))}
+          </>
+        ) : (
+          <>
+            <button
+              onClick={() => {
+                setSelected(null);
+                setError("");
+                setSenha("");
+              }}
+              style={{ background: "transparent", border: "none", color: "#6B6A57", fontSize: 13, fontWeight: 700, cursor: "pointer", padding: 0, marginBottom: 18, fontFamily: "inherit" }}
+            >
+              ‹ voltar
+            </button>
+            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", marginBottom: 20 }}>
+              <UserCircle2 size={40} color="#2E4A2B" style={{ marginBottom: 8 }} />
+              <div style={{ fontSize: 17, fontWeight: 800, color: "#20241A" }}>{selected.nome}</div>
+            </div>
+            <Field label="Senha numérica">
+              <TextInput
+                autoFocus
+                type="password"
+                inputMode="numeric"
+                placeholder="••••"
+                value={senha}
+                onChange={(e) => {
+                  setSenha(e.target.value.replace(/\D/g, ""));
+                  setError("");
+                }}
+                onKeyDown={(e) => e.key === "Enter" && tryLogin()}
+                style={{ textAlign: "center", fontSize: 22, letterSpacing: "0.3em", ...(error ? errStyle : {}) }}
+              />
+            </Field>
+            {error && (
+              <div style={{ display: "flex", alignItems: "center", gap: 6, color: "#B5442E", fontSize: 13, marginBottom: 10 }}>
+                <AlertCircle size={14} /> {error}
+              </div>
+            )}
+            <Btn onClick={tryLogin} style={{ width: "100%", padding: "13px 0", fontSize: 15.5 }}>
+              <KeyRound size={16} /> Entrar
+            </Btn>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function App() {
+  const [ready, setReady] = useState(false);
+  const [tab, setTab] = useState("lancar");
+  const [saving, setSaving] = useState(false);
+  const [toast, setToast] = useState(null);
+
+  const [medicamentos, setMedicamentos] = useState([]);
+  const [motivos, setMotivos] = useState([]);
+  const [currais, setCurrais] = useState([]);
+  const [lancamentos, setLancamentos] = useState([]);
+  const [animaisMap, setAnimaisMap] = useState({});
+  const [animaisSyncing, setAnimaisSyncing] = useState(false);
+  const [animaisUpdatedAt, setAnimaisUpdatedAt] = useState(null);
+  const [usuarios, setUsuarios] = useState([]);
+  const [currentUser, setCurrentUser] = useState(null);
+
+  const showToast = (msg, tone = "ok") => {
+    setToast({ msg, tone });
+    setTimeout(() => setToast(null), 2600);
+  };
+
+  const loadAll = useCallback(async (opts = {}) => {
+    const silent = !!opts.silent;
+    try {
+      const [medR, motR, curR, usrR] = await Promise.all([
+        window.storage.get("cfg:medicamentos", true).catch(() => null),
+        window.storage.get("cfg:motivos", true).catch(() => null),
+        window.storage.get("cfg:currais", true).catch(() => null),
+        window.storage.get("cfg:usuarios", true).catch(() => null),
+      ]);
+      let medList = medR ? safeJsonParse(medR.value, []) : [];
+      let motList = motR ? safeJsonParse(motR.value, []) : [];
+
+      if (medList.length === 0) {
+        medList = SEED_MEDICAMENTOS;
+        window.storage.set("cfg:medicamentos", JSON.stringify(medList), true).catch(() => {});
+      }
+      if (motList.length === 0) {
+        motList = SEED_MOTIVOS;
+        window.storage.set("cfg:motivos", JSON.stringify(motList), true).catch(() => {});
+      }
+
+      setMedicamentos(medList);
+      setMotivos(motList);
+      setCurrais(curR ? safeJsonParse(curR.value, []) : []);
+      setUsuarios(usrR ? safeJsonParse(usrR.value, []) : []);
+
+      const animIdxR = await window.storage.get("cfg:animais_index", true).catch(() => null);
+      if (animIdxR) {
+        try {
+          const idx = safeJsonParse(animIdxR.value, {});
+          const chunkKeys = Array.from({ length: idx.chunkCount || 0 }, (_, i) => `animais:chunk:${i}`);
+          const chunkResults = await Promise.all(chunkKeys.map((k) => window.storage.get(k, true).catch(() => null)));
+          const merged = {};
+          chunkResults.forEach((r) => {
+            if (r) {
+              try {
+                Object.assign(merged, JSON.parse(r.value));
+              } catch {}
+            }
+          });
+          setAnimaisMap(merged);
+          setAnimaisUpdatedAt(idx.updatedAt || null);
+        } catch {}
+      } else {
+        setAnimaisMap({});
+        setAnimaisUpdatedAt(null);
+      }
+
+      const idx = await window.storage.list("lanc:", true).catch(() => null);
+      if (idx && idx.keys && idx.keys.length) {
+        const recs = await Promise.all(
+          idx.keys.map((k) => window.storage.get(k, true).catch(() => null))
+        );
+        const parsed = recs
+          .filter(Boolean)
+          .map((r) => {
+            try {
+              return JSON.parse(r.value);
+            } catch {
+              return null;
+            }
+          })
+          .filter(Boolean)
+          .sort((a, b) => (b.dataRegistro || 0) - (a.dataRegistro || 0));
+        setLancamentos(parsed);
+      } else {
+        setLancamentos([]);
+      }
+    } catch (e) {
+      if (!silent) showToast("Não consegui carregar os dados. Puxe para atualizar.", "err");
+    } finally {
+      setReady(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadAll();
+  }, [loadAll]);
+
+  useEffect(() => {
+    const t = setInterval(() => {
+      loadAll({ silent: true });
+    }, 45000);
+    return () => clearInterval(t);
+  }, [loadAll]);
+
+  const saveConfig = async (key, value, setter) => {
+    setter(value);
+    try {
+      await window.storage.set(`cfg:${key}`, JSON.stringify(value), true);
+    } catch {
+      showToast("Falha ao salvar cadastro.", "err");
+    }
+  };
+
+  const addMedicamento = (nome) => {
+    nome = nome.trim().toUpperCase();
+    if (!nome || medicamentos.some((m) => m.nome === nome)) return;
+    saveConfig("medicamentos", [...medicamentos, { nome, lotes: [] }], setMedicamentos);
+  };
+  const removeMedicamento = (nome) => {
+    saveConfig("medicamentos", medicamentos.filter((m) => m.nome !== nome), setMedicamentos);
+  };
+  const addLote = (nome, lote) => {
+    lote = lote.trim();
+    if (!lote) return;
+    const next = medicamentos.map((m) =>
+      m.nome === nome && !m.lotes.includes(lote) ? { ...m, lotes: [...m.lotes, lote] } : m
+    );
+    saveConfig("medicamentos", next, setMedicamentos);
+  };
+  const removeLote = (nome, lote) => {
+    const next = medicamentos.map((m) =>
+      m.nome === nome ? { ...m, lotes: m.lotes.filter((l) => l !== lote) } : m
+    );
+    saveConfig("medicamentos", next, setMedicamentos);
+  };
+
+  const addMotivo = (v) => {
+    v = v.trim().toUpperCase();
+    if (!v || motivos.includes(v)) return;
+    saveConfig("motivos", [...motivos, v], setMotivos);
+  };
+  const removeMotivo = (v) => saveConfig("motivos", motivos.filter((m) => m !== v), setMotivos);
+
+  const addCurral = (v) => {
+    v = v.trim().toUpperCase();
+    if (!v || currais.includes(v)) return;
+    saveConfig("currais", [...currais, v], setCurrais);
+  };
+  const removeCurral = (v) => saveConfig("currais", currais.filter((c) => c !== v), setCurrais);
+
+  const addUsuario = async (nome, senha) => {
+    nome = nome.trim();
+    senha = senha.replace(/\D/g, "");
+    if (!nome || !senha) return;
+    const senhaHash = await hashPin(senha); // nunca guardamos o PIN em texto puro
+    const next = [...usuarios.filter((u) => u.nome.toLowerCase() !== nome.toLowerCase()), { nome, senhaHash }];
+    saveConfig("usuarios", next, setUsuarios);
+  };
+  const removeUsuario = (nome) => {
+    saveConfig("usuarios", usuarios.filter((u) => u.nome !== nome), setUsuarios);
+    if (currentUser?.nome === nome) setCurrentUser(null);
+  };
+  const logout = () => setCurrentUser(null);
+
+  const ANIMAIS_CHUNK_SIZE = 3000;
+
+  const refreshAnimais = async () => {
+    setAnimaisSyncing(true);
+    try {
+      const animIdxR = await window.storage.get("cfg:animais_index", true).catch(() => null);
+      if (animIdxR) {
+        const idx = safeJsonParse(animIdxR.value, {});
+        const chunkKeys = Array.from({ length: idx.chunkCount || 0 }, (_, i) => `animais:chunk:${i}`);
+        const chunkResults = await Promise.all(chunkKeys.map((k) => window.storage.get(k, true).catch(() => null)));
+        const merged = {};
+        chunkResults.forEach((r) => {
+          if (r) {
+            try {
+              Object.assign(merged, JSON.parse(r.value));
+            } catch {}
+          }
+        });
+        setAnimaisMap(merged);
+        setAnimaisUpdatedAt(idx.updatedAt || null);
+        showToast("Banco de dados de SISBOV atualizado.");
+      } else {
+        setAnimaisMap({});
+        setAnimaisUpdatedAt(null);
+        showToast("Nenhum animal cadastrado ainda.");
+      }
+    } catch {
+      showToast("Falha ao atualizar o banco de dados.", "err");
+    } finally {
+      setAnimaisSyncing(false);
+    }
+  };
+
+  const importAnimais = async (rows) => {
+    setAnimaisSyncing(true);
+    try {
+      const fresh = {};
+      rows.forEach((r) => {
+        fresh[r.sisbov] = r.curral || null;
+      });
+      const entries = Object.entries(fresh);
+      const chunkCount = Math.max(1, Math.ceil(entries.length / ANIMAIS_CHUNK_SIZE));
+
+      for (let i = 0; i < chunkCount; i++) {
+        const chunkObj = Object.fromEntries(entries.slice(i * ANIMAIS_CHUNK_SIZE, (i + 1) * ANIMAIS_CHUNK_SIZE));
+        await window.storage.set(`animais:chunk:${i}`, JSON.stringify(chunkObj), true);
+      }
+
+      const oldIdxR = await window.storage.get("cfg:animais_index", true).catch(() => null);
+      const oldChunkCount = oldIdxR ? safeJsonParse(oldIdxR.value, {}).chunkCount || 0 : 0;
+      for (let i = chunkCount; i < oldChunkCount; i++) {
+        await window.storage.delete(`animais:chunk:${i}`, true).catch(() => {});
+      }
+
+      const meta = { chunkCount, updatedAt: Date.now(), count: entries.length };
+      await window.storage.set("cfg:animais_index", JSON.stringify(meta), true);
+      setAnimaisMap(fresh);
+      setAnimaisUpdatedAt(meta.updatedAt);
+      showToast(`Banco de dados substituído: ${entries.length} animal(is) na versão atual.`);
+    } catch {
+      showToast("Falha ao importar os animais.", "err");
+    } finally {
+      setAnimaisSyncing(false);
+    }
+  };
+
+  const lookupAnimais = (query) => {
+    if (!query) return [];
+    const entries = Object.entries(animaisMap);
+    if (query.length >= 15) {
+      const curral = animaisMap[query];
+      return curral !== undefined ? [{ sisbov: query, curral }] : [];
+    }
+    // Ignora o dígito verificador (último dígito do SISBOV): a busca passa a
+    // considerar só o número de manejo. Se isso resultar em mais de um
+    // animal, o chamador (LancarTab/HistoricoTab) mostra a lista para o
+    // usuário escolher qual é o correto.
+    return entries.filter(([sisbov]) => sisbov.slice(0, -1).endsWith(query)).map(([sisbov, curral]) => ({ sisbov, curral }));
+  };
+
+  const addLancamento = async (rec) => {
+    setSaving(true);
+    const id = `lanc:${uid()}`;
+    const full = { ...rec, id, ordem: lancamentos.length + 1, dataRegistro: Date.now() };
+    try {
+      await window.storage.set(id, JSON.stringify(full), true);
+      setLancamentos((prev) => [full, ...prev]);
+      showToast("Lançamento salvo.");
+    } catch {
+      showToast("Falha ao salvar o lançamento. Tente de novo.", "err");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const deleteLancamento = async (id) => {
+    try {
+      await window.storage.delete(id, true);
+      setLancamentos((prev) => prev.filter((l) => l.id !== id));
+      showToast("Lançamento removido.");
+    } catch {
+      showToast("Falha ao remover.", "err");
+    }
+  };
+
+  const updateLancamento = async (id, patch) => {
+    try {
+      const existing = lancamentos.find((l) => l.id === id);
+      if (!existing) return;
+      const updated = { ...existing, ...patch };
+      await window.storage.set(id, JSON.stringify(updated), true);
+      setLancamentos((prev) => prev.map((l) => (l.id === id ? updated : l)));
+      showToast("Lançamento atualizado.");
+    } catch {
+      showToast("Falha ao atualizar o lançamento.", "err");
+    }
+  };
+
+  if (!ready) {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: 420, gap: 10, color: "#6B6A57", fontFamily: "system-ui, -apple-system, sans-serif" }}>
+        <Loader2 size={26} style={{ animation: "spin 1s linear infinite" }} />
+        <div style={{ fontSize: 14 }}>Carregando dados da nuvem…</div>
+      </div>
+    );
+  }
+
+  if (usuarios.length > 0 && !currentUser) {
+    return <LoginScreen usuarios={usuarios} onLogin={(nome) => setCurrentUser({ nome })} />;
+  }
+
+  return (
+    <div
+      style={{
+        fontFamily: "system-ui, -apple-system, 'Segoe UI', sans-serif",
+        background: "#F3F4EC",
+        minHeight: 640,
+        maxWidth: 460,
+        margin: "0 auto",
+        borderRadius: 18,
+        overflow: "hidden",
+        border: "1px solid #E3E1D3",
+        display: "flex",
+        flexDirection: "column",
+        position: "relative",
+      }}
+    >
+      <div style={{ background: "#2E4A2B", padding: "16px 18px 14px", color: "#F3F4EC" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          <div>
+            <div style={{ fontSize: 18, fontWeight: 800, letterSpacing: "0.01em" }}>Controle de Medicamentos</div>
+            <div style={{ fontSize: 12, color: "#B9C8AE", marginTop: 2 }}>Lançamentos compartilhados na nuvem</div>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+            <button
+              onClick={loadAll}
+              aria-label="Atualizar"
+              style={{ background: "transparent", border: "none", color: "#B9C8AE", cursor: "pointer", padding: 6 }}
+            >
+              <RefreshCw size={18} />
+            </button>
+          </div>
+        </div>
+        {currentUser && (
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 10, paddingTop: 10, borderTop: "1px solid rgba(255,255,255,0.15)" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12.5, color: "#DCE6D2", fontWeight: 700 }}>
+              <UserCircle2 size={15} /> {currentUser.nome}
+            </div>
+            <button
+              onClick={logout}
+              style={{ display: "flex", alignItems: "center", gap: 5, background: "transparent", border: "none", color: "#DCE6D2", cursor: "pointer", fontSize: 12, fontWeight: 700, fontFamily: "inherit" }}
+            >
+              <LogOut size={13} /> trocar usuário
+            </button>
+          </div>
+        )}
+      </div>
+
+      <div style={{ flex: 1, overflowY: "auto", padding: "16px 16px 90px" }}>
+        {tab === "lancar" && (
+          <LancarTab
+            medicamentos={medicamentos}
+            motivos={motivos}
+            currais={currais}
+            onSubmit={addLancamento}
+            saving={saving}
+            addMotivo={addMotivo}
+            addCurral={addCurral}
+            lookupAnimais={lookupAnimais}
+            currentUser={currentUser}
+            animaisUpdatedAt={animaisUpdatedAt}
+          />
+        )}
+        {tab === "historico" && (
+          <HistoricoTab
+            lancamentos={lancamentos}
+            onDelete={deleteLancamento}
+            onUpdate={updateLancamento}
+            medicamentos={medicamentos}
+            motivos={motivos}
+            currais={currais}
+          />
+        )}
+        {tab === "cadastros" && (
+          <CadastrosTab
+            medicamentos={medicamentos}
+            motivos={motivos}
+            currais={currais}
+            addMedicamento={addMedicamento}
+            removeMedicamento={removeMedicamento}
+            addLote={addLote}
+            removeLote={removeLote}
+            addMotivo={addMotivo}
+            removeMotivo={removeMotivo}
+            addCurral={addCurral}
+            removeCurral={removeCurral}
+            animaisCount={Object.keys(animaisMap).length}
+            animaisSyncing={animaisSyncing}
+            animaisUpdatedAt={animaisUpdatedAt}
+            onRefreshAnimais={refreshAnimais}
+            onImportAnimais={importAnimais}
+            usuarios={usuarios}
+            addUsuario={addUsuario}
+            removeUsuario={removeUsuario}
+          />
+        )}
+      </div>
+
+      <div
+        style={{
+          position: "sticky",
+          bottom: 0,
+          display: "flex",
+          borderTop: "1px solid #E3E1D3",
+          background: "#FFFFFF",
+        }}
+      >
+        <NavBtn active={tab === "lancar"} onClick={() => setTab("lancar")} icon={<Syringe size={20} />} label="Lançar" />
+        <NavBtn active={tab === "historico"} onClick={() => setTab("historico")} icon={<ClipboardList size={20} />} label="Histórico" />
+        <NavBtn active={tab === "cadastros"} onClick={() => setTab("cadastros")} icon={<Settings size={20} />} label="Cadastros" />
+      </div>
+
+      {toast && (
+        <div
+          style={{
+            position: "absolute",
+            left: 16,
+            right: 16,
+            bottom: 78,
+            background: toast.tone === "err" ? "#B5442E" : "#2E4A2B",
+            color: "#fff",
+            padding: "10px 14px",
+            borderRadius: 10,
+            fontSize: 13.5,
+            fontWeight: 600,
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            boxSizing: "border-box",
+          }}
+        >
+          {toast.tone === "err" ? <AlertCircle size={16} /> : <Check size={16} />}
+          {toast.msg}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function NavBtn({ active, onClick, icon, label }) {
+  return (
+    <button
+      onClick={onClick}
+      style={{
+        flex: 1,
+        background: "transparent",
+        border: "none",
+        padding: "10px 0 12px",
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        gap: 3,
+        color: active ? "#2E4A2B" : "#9C9A88",
+        cursor: "pointer",
+        fontFamily: "inherit",
+      }}
+    >
+      {icon}
+      <span style={{ fontSize: 11, fontWeight: active ? 800 : 600 }}>{label}</span>
+    </button>
+  );
+}
+
+function emptyMedSlot() {
+  return { medicamento: "", lote: "", ml: "" };
+}
+
+function LancarTab({ medicamentos, motivos, currais, onSubmit, saving, addMotivo, addCurral, lookupAnimais, currentUser, animaisUpdatedAt }) {
+  const [data, setData] = useState(todayStr());
+  const [sisbov, setSisbov] = useState("");
+  const [motivo, setMotivo] = useState("");
+  const [novoMotivo, setNovoMotivo] = useState(false);
+  const [slots, setSlots] = useState([emptyMedSlot()]);
+  const [destino, setDestino] = useState("");
+  const [novoDestino, setNovoDestino] = useState(false);
+  const [peso, setPeso] = useState("");
+  const [temp, setTemp] = useState("");
+  const [modalidade, setModalidade] = useState("");
+  const [protocolo, setProtocolo] = useState("");
+  const [responsavel, setResponsavel] = useState(currentUser?.nome || "");
+  const [obs, setObs] = useState("");
+  const [errors, setErrors] = useState({});
+  const [matches, setMatches] = useState([]);
+  const [selectedAnimal, setSelectedAnimal] = useState(null);
+  const [checkingAnimal, setCheckingAnimal] = useState(false);
+  const [showMaisCampos, setShowMaisCampos] = useState(false);
+
+  const updateSlot = (i, patch) => {
+    setSlots((prev) => prev.map((s, idx) => (idx === i ? { ...s, ...patch } : s)));
+  };
+  const addSlot = () => slots.length < 3 && setSlots([...slots, emptyMedSlot()]);
+  const removeSlot = (i) => setSlots(slots.filter((_, idx) => idx !== i));
+
+  const reset = () => {
+    setSisbov("");
+    setMotivo("");
+    setSlots([emptyMedSlot()]);
+    setDestino("");
+    setPeso("");
+    setTemp("");
+    setModalidade("");
+    setProtocolo("");
+    setObs("");
+    setErrors({});
+    setMatches([]);
+    setSelectedAnimal(null);
+  };
+
+  useEffect(() => {
+    const digits = sisbov.replace(/\D/g, "");
+    setSelectedAnimal(null);
+    if (!lookupAnimais || digits.length < 5) {
+      setMatches([]);
+      return;
+    }
+    let cancelled = false;
+    setCheckingAnimal(true);
+    const t = setTimeout(() => {
+      const found = lookupAnimais(digits);
+      if (!cancelled) {
+        setMatches(found);
+        if (found.length === 1) setSelectedAnimal(found[0]);
+        setCheckingAnimal(false);
+      }
+    }, 400);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [sisbov, lookupAnimais]);
+
+  const finalSisbov = selectedAnimal ? selectedAnimal.sisbov : sisbov.replace(/\D/g, "");
+
+  const validate = () => {
+    const e = {};
+    if (!data) e.data = true;
+    if (!finalSisbov || finalSisbov.length < 5) e.sisbov = true;
+    if (matches.length > 1 && !selectedAnimal) e.sisbov = true;
+    if (!motivo) e.motivo = true;
+    if (!slots[0].medicamento || !slots[0].ml) e.slot0 = true;
+    if (!responsavel.trim()) e.responsavel = true;
+    setErrors(e);
+    return Object.keys(e).length === 0;
+  };
+
+  const handleSubmit = () => {
+    if (!validate()) return;
+    onSubmit({
+      data,
+      sisbov: finalSisbov,
+      motivo,
+      medicamentos: slots.filter((s) => s.medicamento && s.ml),
+      destino: destino || null,
+      peso: peso ? Number(peso) : null,
+      temperatura: temp ? Number(temp) : null,
+      modalidade: modalidade || null,
+      protocolo: protocolo.trim() || null,
+      responsavel: responsavel.trim(),
+      observacao: obs.trim() || null,
+    });
+    reset();
+  };
+
+  return (
+    <div>
+      {animaisUpdatedAt && (
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+            background: "#EDEBDD",
+            color: "#6B6A57",
+            fontSize: 11.5,
+            fontWeight: 700,
+            borderRadius: 8,
+            padding: "7px 10px",
+            marginBottom: 14,
+          }}
+        >
+          <RefreshCw size={12} /> Banco de SISBOV atualizado em {fmtDateTime(animaisUpdatedAt)}
+        </div>
+      )}
+
+      <Field label="Data" required>
+        <TextInput type="date" value={data} onChange={(e) => setData(e.target.value)} style={errors.data ? errStyle : {}} />
+      </Field>
+
+      <Field label="SISBOV do animal" required hint="Digite os últimos números do manejo (sem o dígito verificador)">
+        <TextInput
+          inputMode="numeric"
+          placeholder="Ex: 674745"
+          value={sisbov}
+          onChange={(e) => setSisbov(e.target.value.replace(/[^\d]/g, ""))}
+          style={errors.sisbov ? errStyle : {}}
+        />
+        {checkingAnimal && (
+          <div style={{ fontSize: 11.5, color: "#9C9A88", marginTop: 4, display: "flex", alignItems: "center", gap: 5 }}>
+            <Loader2 size={12} style={{ animation: "spin 1s linear infinite" }} /> buscando no banco de dados…
+          </div>
+        )}
+
+        {!checkingAnimal && matches.length > 1 && (
+          <div style={{ marginTop: 8 }}>
+            <div style={{ fontSize: 12, color: "#B5442E", fontWeight: 700, marginBottom: 6, display: "flex", alignItems: "center", gap: 5 }}>
+              <AlertCircle size={13} /> {matches.length} animais encontram com esses números. Escolha qual vai medicar:
+            </div>
+            {matches.map((m) => (
+              <button
+                key={m.sisbov}
+                type="button"
+                onClick={() => setSelectedAnimal(m)}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  width: "100%",
+                  boxSizing: "border-box",
+                  background: selectedAnimal?.sisbov === m.sisbov ? "#EAF3DE" : "#FFFFFF",
+                  border: selectedAnimal?.sisbov === m.sisbov ? "1.5px solid #639922" : "1px solid #E3E1D3",
+                  borderRadius: 10,
+                  padding: "9px 12px",
+                  marginBottom: 6,
+                  cursor: "pointer",
+                  fontFamily: "inherit",
+                  textAlign: "left",
+                }}
+              >
+                <EarTag>{m.sisbov}</EarTag>
+                <span style={{ fontSize: 12.5, color: "#4A4E3F", fontWeight: 600 }}>{m.curral ? `local: ${m.curral}` : "sem local atual"}</span>
+              </button>
+            ))}
+          </div>
+        )}
+
+        {!checkingAnimal && matches.length === 1 && selectedAnimal && (
+          <div style={{ fontSize: 12, color: "#2E4A2B", marginTop: 5, display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            <Check size={13} /> Animal encontrado: <EarTag>{selectedAnimal.sisbov}</EarTag>
+            {selectedAnimal.curral && (
+              <>
+                · local atual: <strong>{selectedAnimal.curral}</strong>
+              </>
+            )}
+            {selectedAnimal.curral && !destino && (
+              <button
+                type="button"
+                onClick={() => setDestino(selectedAnimal.curral)}
+                style={{ background: "transparent", border: "none", color: "#D98F1F", fontWeight: 700, cursor: "pointer", fontSize: 12, padding: 0, fontFamily: "inherit" }}
+              >
+                usar como destino
+              </button>
+            )}
+          </div>
+        )}
+
+        {!checkingAnimal && matches.length === 0 && sisbov.replace(/\D/g, "").length >= 5 && (
+          <div style={{ fontSize: 11.5, color: "#A9A791", marginTop: 4 }}>Animal não encontrado no banco de dados de SISBOV.</div>
+        )}
+      </Field>
+
+      <Field label="Motivo" required>
+        {!novoMotivo ? (
+          <div style={{ display: "flex", gap: 8 }}>
+            <Select value={motivo} onChange={(e) => setMotivo(e.target.value)} style={errors.motivo ? errStyle : {}}>
+              <option value="">Selecione…</option>
+              {motivos.map((m) => (
+                <option key={m} value={m}>
+                  {m}
+                </option>
+              ))}
+            </Select>
+            <Btn variant="ghost" onClick={() => setNovoMotivo(true)}>
+              <Plus size={16} />
+            </Btn>
+          </div>
+        ) : (
+          <NewInline
+            placeholder="Novo motivo"
+            onCancel={() => setNovoMotivo(false)}
+            onSave={(v) => {
+              addMotivo(v);
+              setMotivo(v.trim().toUpperCase());
+              setNovoMotivo(false);
+            }}
+          />
+        )}
+      </Field>
+
+      <SectionTitle>Medicamentos aplicados</SectionTitle>
+      {slots.map((slot, i) => (
+        <MedSlot
+          key={i}
+          index={i}
+          slot={slot}
+          medicamentos={medicamentos}
+          onChange={(patch) => updateSlot(i, patch)}
+          onRemove={slots.length > 1 ? () => removeSlot(i) : null}
+          error={i === 0 && errors.slot0}
+        />
+      ))}
+      {slots.length < 3 && (
+        <button
+          onClick={addSlot}
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+            background: "transparent",
+            border: "1.5px dashed #C8C6B4",
+            borderRadius: 10,
+            padding: "9px 12px",
+            color: "#6B6A57",
+            fontSize: 13.5,
+            fontWeight: 700,
+            cursor: "pointer",
+            width: "100%",
+            justifyContent: "center",
+            marginBottom: 6,
+            fontFamily: "inherit",
+          }}
+        >
+          <Plus size={15} /> Adicionar outro medicamento
+        </button>
+      )}
+
+      <SectionTitle>Destino e observações</SectionTitle>
+
+      <Field label="Curral de destino">
+        {!novoDestino ? (
+          <div style={{ display: "flex", gap: 8 }}>
+            <Select value={destino} onChange={(e) => setDestino(e.target.value)}>
+              <option value="">Selecione…</option>
+              {currais.map((c) => (
+                <option key={c} value={c}>
+                  {c}
+                </option>
+              ))}
+            </Select>
+            <Btn variant="ghost" onClick={() => setNovoDestino(true)}>
+              <Plus size={16} />
+            </Btn>
+          </div>
+        ) : (
+          <NewInline
+            placeholder="Novo curral"
+            onCancel={() => setNovoDestino(false)}
+            onSave={(v) => {
+              addCurral(v);
+              setDestino(v.trim().toUpperCase());
+              setNovoDestino(false);
+            }}
+          />
+        )}
+      </Field>
+
+      <button
+        type="button"
+        onClick={() => setShowMaisCampos(!showMaisCampos)}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          width: "100%",
+          boxSizing: "border-box",
+          background: "transparent",
+          border: "1.5px dashed #C8C6B4",
+          borderRadius: 10,
+          padding: "10px 12px",
+          marginBottom: showMaisCampos ? 10 : 14,
+          cursor: "pointer",
+          fontFamily: "inherit",
+          color: "#6B6A57",
+          fontSize: 13,
+          fontWeight: 700,
+        }}
+      >
+        Modalidade, protocolo, peso e temperatura (opcional)
+        {showMaisCampos ? <ChevronUp size={16} color="#9C9A88" /> : <ChevronDown size={16} color="#9C9A88" />}
+      </button>
+
+      {showMaisCampos && (
+        <>
+          <div style={{ display: "flex", gap: 10 }}>
+            <div style={{ flex: 1 }}>
+              <Field label="Modalidade" hint="Via de aplicação">
+                <Select value={modalidade} onChange={(e) => setModalidade(e.target.value)}>
+                  <option value="">Selecione…</option>
+                  <option value="IM">IM — Intramuscular</option>
+                  <option value="SC">SC — Subcutânea</option>
+                  <option value="IV">IV — Intravenosa</option>
+                  <option value="ORAL">Oral</option>
+                  <option value="TOPICA">Tópica</option>
+                  <option value="OUTRA">Outra</option>
+                </Select>
+              </Field>
+            </div>
+            <div style={{ flex: 1 }}>
+              <Field label="Protocolo">
+                <TextInput placeholder="Opcional" value={protocolo} onChange={(e) => setProtocolo(e.target.value)} />
+              </Field>
+            </div>
+          </div>
+
+          <div style={{ display: "flex", gap: 10 }}>
+            <div style={{ flex: 1 }}>
+              <Field label="Peso (kg)">
+                <TextInput inputMode="decimal" placeholder="—" value={peso} onChange={(e) => setPeso(e.target.value.replace(/[^\d.]/g, ""))} />
+              </Field>
+            </div>
+            <div style={{ flex: 1 }}>
+              <Field label="Temperatura (°C)">
+                <TextInput inputMode="decimal" placeholder="—" value={temp} onChange={(e) => setTemp(e.target.value.replace(/[^\d.]/g, ""))} />
+              </Field>
+            </div>
+          </div>
+        </>
+      )}
+
+      <Field label="Responsável" required>
+        {currentUser ? (
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              border: "1.5px solid #D7D5C4",
+              borderRadius: 10,
+              padding: "11px 12px",
+              background: "#EDEBDD",
+              color: "#20241A",
+              fontSize: 15,
+              fontWeight: 700,
+            }}
+          >
+            <UserCircle2 size={16} color="#2E4A2B" /> {responsavel}
+          </div>
+        ) : (
+          <TextInput placeholder="Seu nome" value={responsavel} onChange={(e) => setResponsavel(e.target.value)} style={errors.responsavel ? errStyle : {}} />
+        )}
+      </Field>
+
+      <Field label="Observação">
+        <TextArea placeholder="Opcional" value={obs} onChange={(e) => setObs(e.target.value)} />
+      </Field>
+
+      {Object.keys(errors).length > 0 && (
+        <div style={{ display: "flex", alignItems: "center", gap: 6, color: "#B5442E", fontSize: 13, marginBottom: 10 }}>
+          <AlertCircle size={15} /> Preencha os campos obrigatórios marcados.
+        </div>
+      )}
+
+      <Btn onClick={handleSubmit} disabled={saving} style={{ width: "100%", padding: "13px 0", fontSize: 15.5 }}>
+        {saving ? <Loader2 size={17} style={{ animation: "spin 1s linear infinite" }} /> : <Syringe size={17} />}
+        {saving ? "Salvando…" : "Registrar lançamento"}
+      </Btn>
+    </div>
+  );
+}
+
+function NewInline({ placeholder, onSave, onCancel }) {
+  const [v, setV] = useState("");
+  return (
+    <div style={{ display: "flex", gap: 8 }}>
+      <TextInput autoFocus placeholder={placeholder} value={v} onChange={(e) => setV(e.target.value)} />
+      <Btn
+        variant="accent"
+        onClick={() => {
+          if (v.trim()) onSave(v);
+        }}
+      >
+        <Check size={16} />
+      </Btn>
+      <Btn variant="ghost" onClick={onCancel}>
+        <X size={16} />
+      </Btn>
+    </div>
+  );
+}
+
+function MedSlot({ index, slot, medicamentos, onChange, onRemove, error }) {
+  return (
+    <Card style={{ marginBottom: 10, padding: "12px 12px 4px", border: error ? "1.5px solid #D98C77" : "1px solid #E3E1D3" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+        <div style={{ fontSize: 11.5, fontWeight: 800, color: "#6B6A57", textTransform: "uppercase" }}>
+          Medicamento {index + 1} {index === 0 && <span style={{ color: "#B5442E" }}>*</span>}
+        </div>
+        {onRemove && (
+          <button onClick={onRemove} aria-label="Remover" style={{ background: "transparent", border: "none", color: "#A9A791", cursor: "pointer" }}>
+            <X size={16} />
+          </button>
+        )}
+      </div>
+      <div style={{ marginBottom: 10 }}>
+        <Select
+          value={slot.medicamento}
+          onChange={(e) => {
+            const nome = e.target.value;
+            const found = medicamentos.find((m) => m.nome === nome);
+            onChange({ medicamento: nome, lote: found?.lotes?.[0] || "" });
+          }}
+        >
+          <option value="">Selecione o medicamento…</option>
+          {medicamentos.map((m) => (
+            <option key={m.nome} value={m.nome}>
+              {m.nome}
+            </option>
+          ))}
+        </Select>
+      </div>
+      <div style={{ display: "flex", gap: 10, marginBottom: 10 }}>
+        <div style={{ flex: 1 }}>
+          <TextInput inputMode="decimal" placeholder="ML" value={slot.ml} onChange={(e) => onChange({ ml: e.target.value.replace(/[^\d.]/g, "") })} />
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+function csvEscapeSemi(value) {
+  const s = value === null || value === undefined ? "" : String(value);
+  if (/[;"\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+
+async function shareOrDownloadFile(filename, content, mime = "text/csv;charset=utf-8;") {
+  const withBom = "\uFEFF" + content;
+
+  try {
+    if (navigator.canShare && navigator.share) {
+      const file = new File([withBom], filename, { type: mime });
+      if (navigator.canShare({ files: [file] })) {
+        await navigator.share({ files: [file], title: filename });
+        return { ok: true, method: "share" };
+      }
+    }
+  } catch (e) {
+    if (e && e.name === "AbortError") return { ok: true, method: "cancelled" };
+  }
+
+  try {
+    const blob = new Blob([withBom], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+    return { ok: true, method: "download" };
+  } catch (e) {
+    return { ok: false, method: "none", content };
+  }
+}
+
+function EditLancamentoForm({ lancamento, medicamentos, motivos, currais, onSave, onCancel }) {
+  const [data, setData] = useState(lancamento.data || todayStr());
+  const [sisbov, setSisbov] = useState(lancamento.sisbov || "");
+  const [motivo, setMotivo] = useState(lancamento.motivo || "");
+  const [slots, setSlots] = useState(
+    lancamento.medicamentos && lancamento.medicamentos.length
+      ? lancamento.medicamentos.map((m) => ({ medicamento: m.medicamento || "", lote: m.lote || "", ml: m.ml || "" }))
+      : [emptyMedSlot()]
+  );
+  const [destino, setDestino] = useState(lancamento.destino || "");
+  const [peso, setPeso] = useState(lancamento.peso != null ? String(lancamento.peso) : "");
+  const [temp, setTemp] = useState(lancamento.temperatura != null ? String(lancamento.temperatura) : "");
+  const [modalidade, setModalidade] = useState(lancamento.modalidade || "");
+  const [protocolo, setProtocolo] = useState(lancamento.protocolo || "");
+  const [responsavel, setResponsavel] = useState(lancamento.responsavel || "");
+  const [obs, setObs] = useState(lancamento.observacao || "");
+  const [errors, setErrors] = useState({});
+
+  const updateSlot = (i, patch) => setSlots((prev) => prev.map((s, idx) => (idx === i ? { ...s, ...patch } : s)));
+  const addSlot = () => slots.length < 3 && setSlots([...slots, emptyMedSlot()]);
+  const removeSlot = (i) => setSlots(slots.filter((_, idx) => idx !== i));
+
+  const validate = () => {
+    const e = {};
+    if (!data) e.data = true;
+    if (!sisbov || sisbov.replace(/\D/g, "").length < 5) e.sisbov = true;
+    if (!motivo) e.motivo = true;
+    if (!slots[0].medicamento || !slots[0].ml) e.slot0 = true;
+    if (!responsavel.trim()) e.responsavel = true;
+    setErrors(e);
+    return Object.keys(e).length === 0;
+  };
+
+  const handleSave = () => {
+    if (!validate()) return;
+    onSave({
+      data,
+      sisbov: sisbov.replace(/\D/g, ""),
+      motivo,
+      medicamentos: slots.filter((s) => s.medicamento && s.ml),
+      destino: destino || null,
+      peso: peso ? Number(peso) : null,
+      temperatura: temp ? Number(temp) : null,
+      modalidade: modalidade || null,
+      protocolo: protocolo.trim() || null,
+      responsavel: responsavel.trim(),
+      observacao: obs.trim() || null,
+    });
+  };
+
+  return (
+    <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid #EDEBDD" }} onClick={(e) => e.stopPropagation()}>
+      <div style={{ display: "flex", gap: 10 }}>
+        <div style={{ flex: 1 }}>
+          <Field label="Data" required>
+            <TextInput type="date" value={data} onChange={(e) => setData(e.target.value)} style={errors.data ? errStyle : {}} />
+          </Field>
+        </div>
+        <div style={{ flex: 1 }}>
+          <Field label="SISBOV" required>
+            <TextInput
+              inputMode="numeric"
+              value={sisbov}
+              onChange={(e) => setSisbov(e.target.value.replace(/\D/g, ""))}
+              style={errors.sisbov ? errStyle : {}}
+            />
+          </Field>
+        </div>
+      </div>
+
+      <Field label="Motivo" required>
+        <Select value={motivo} onChange={(e) => setMotivo(e.target.value)} style={errors.motivo ? errStyle : {}}>
+          <option value="">Selecione…</option>
+          {motivos.map((m) => (
+            <option key={m} value={m}>
+              {m}
+            </option>
+          ))}
+        </Select>
+      </Field>
+
+      <SectionTitle>Medicamentos aplicados</SectionTitle>
+      {slots.map((slot, i) => (
+        <MedSlot
+          key={i}
+          index={i}
+          slot={slot}
+          medicamentos={medicamentos}
+          onChange={(patch) => updateSlot(i, patch)}
+          onRemove={slots.length > 1 ? () => removeSlot(i) : null}
+          error={i === 0 && errors.slot0}
+        />
+      ))}
+      {slots.length < 3 && (
+        <button
+          onClick={addSlot}
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+            background: "transparent",
+            border: "1.5px dashed #C8C6B4",
+            borderRadius: 10,
+            padding: "9px 12px",
+            color: "#6B6A57",
+            fontSize: 13.5,
+            fontWeight: 700,
+            cursor: "pointer",
+            width: "100%",
+            justifyContent: "center",
+            marginBottom: 10,
+            fontFamily: "inherit",
+          }}
+        >
+          <Plus size={15} /> Adicionar outro medicamento
+        </button>
+      )}
+
+      <Field label="Curral de destino">
+        <Select value={destino} onChange={(e) => setDestino(e.target.value)}>
+          <option value="">Selecione…</option>
+          {currais.map((c) => (
+            <option key={c} value={c}>
+              {c}
+            </option>
+          ))}
+        </Select>
+      </Field>
+
+      <div style={{ display: "flex", gap: 10 }}>
+        <div style={{ flex: 1 }}>
+          <Field label="Modalidade">
+            <Select value={modalidade} onChange={(e) => setModalidade(e.target.value)}>
+              <option value="">Selecione…</option>
+              <option value="IM">IM — Intramuscular</option>
+              <option value="SC">SC — Subcutânea</option>
+              <option value="IV">IV — Intravenosa</option>
+              <option value="ORAL">Oral</option>
+              <option value="TOPICA">Tópica</option>
+              <option value="OUTRA">Outra</option>
+            </Select>
+          </Field>
+        </div>
+        <div style={{ flex: 1 }}>
+          <Field label="Protocolo">
+            <TextInput value={protocolo} onChange={(e) => setProtocolo(e.target.value)} />
+          </Field>
+        </div>
+      </div>
+
+      <div style={{ display: "flex", gap: 10 }}>
+        <div style={{ flex: 1 }}>
+          <Field label="Peso (kg)">
+            <TextInput inputMode="decimal" value={peso} onChange={(e) => setPeso(e.target.value.replace(/[^\d.]/g, ""))} />
+          </Field>
+        </div>
+        <div style={{ flex: 1 }}>
+          <Field label="Temperatura (°C)">
+            <TextInput inputMode="decimal" value={temp} onChange={(e) => setTemp(e.target.value.replace(/[^\d.]/g, ""))} />
+          </Field>
+        </div>
+      </div>
+
+      <Field label="Responsável" required>
+        <TextInput value={responsavel} onChange={(e) => setResponsavel(e.target.value)} style={errors.responsavel ? errStyle : {}} />
+      </Field>
+
+      <Field label="Observação">
+        <TextArea value={obs} onChange={(e) => setObs(e.target.value)} />
+      </Field>
+
+      {Object.keys(errors).length > 0 && (
+        <div style={{ display: "flex", alignItems: "center", gap: 6, color: "#B5442E", fontSize: 13, marginBottom: 10 }}>
+          <AlertCircle size={15} /> Preencha os campos obrigatórios marcados.
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: 8 }}>
+        <Btn onClick={handleSave} style={{ flex: 1 }}>
+          <Check size={15} /> Salvar alterações
+        </Btn>
+        <Btn variant="ghost" onClick={onCancel}>
+          <X size={15} />
+        </Btn>
+      </div>
+    </div>
+  );
+}
+
+// Pesquisa rápida por manejo (mesma lógica da aba Lançar: busca pelos
+// últimos dígitos sem exigir o dígito verificador; se houver mais de um
+// animal com esses dígitos, o usuário escolhe qual).
+function QuickAnimalSearch({ lancamentos }) {
+  const [query, setQuery] = useState("");
+  const [selectedSisbov, setSelectedSisbov] = useState(null);
+  const [show, setShow] = useState(false);
+
+  const digits = query.replace(/\D/g, "");
+
+  const matches = useMemo(() => {
+    if (digits.length < 5) return [];
+    const found = [];
+    const seen = new Set();
+    lancamentos.forEach((l) => {
+      if (!l.sisbov || seen.has(l.sisbov)) return;
+      const isMatch = digits.length >= 15 ? l.sisbov === digits : l.sisbov.endsWith(digits);
+      if (isMatch) {
+        seen.add(l.sisbov);
+        found.push(l.sisbov);
+      }
+    });
+    return found;
+  }, [lancamentos, digits]);
+
+  const effectiveSisbov = matches.length === 1 ? matches[0] : selectedSisbov;
+
+  const stats = useMemo(() => {
+    if (!effectiveSisbov) return null;
+    const registros = lancamentos.filter((l) => l.sisbov === effectiveSisbov);
+    const porMotivo = {};
+    registros.forEach((l) => {
+      const m = l.motivo || "SEM MOTIVO";
+      porMotivo[m] = (porMotivo[m] || 0) + 1;
+    });
+    const motivosOrdenados = Object.entries(porMotivo).sort((a, b) => b[1] - a[1]);
+    const ultima = registros.slice().sort((a, b) => (b.data || "").localeCompare(a.data || ""))[0];
+    return { total: registros.length, motivosOrdenados, ultima };
+  }, [lancamentos, effectiveSisbov]);
+
+  return (
+    <Card style={{ marginBottom: 14 }}>
+      <div
+        style={{ display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer" }}
+        onClick={() => setShow(!show)}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 700, fontSize: 14 }}>
+          <Search size={16} color="#2E4A2B" /> Pesquisa rápida por animal
+        </div>
+        {show ? <ChevronUp size={16} color="#9C9A88" /> : <ChevronDown size={16} color="#9C9A88" />}
+      </div>
+
+      {show && (
+        <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid #EDEBDD" }}>
+          <Field label="Número de manejo" hint="Sem o dígito verificador — se houver mais de um animal, você escolhe qual">
+            <TextInput
+              inputMode="numeric"
+              placeholder="Ex: 674745"
+              value={query}
+              onChange={(e) => {
+                setQuery(e.target.value.replace(/[^\d]/g, ""));
+                setSelectedSisbov(null);
+              }}
+            />
+          </Field>
+
+          {digits.length >= 5 && matches.length === 0 && (
+            <div style={{ fontSize: 12.5, color: "#A9A791" }}>Nenhum lançamento encontrado para esse número.</div>
+          )}
+
+          {matches.length > 1 && (
+            <div style={{ marginBottom: 4 }}>
+              <div style={{ fontSize: 12, color: "#B5442E", fontWeight: 700, marginBottom: 6, display: "flex", alignItems: "center", gap: 5 }}>
+                <AlertCircle size={13} /> {matches.length} animais encontrados com esses números. Escolha qual:
+              </div>
+              {matches.map((s) => (
+                <button
+                  key={s}
+                  type="button"
+                  onClick={() => setSelectedSisbov(s)}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    width: "100%",
+                    boxSizing: "border-box",
+                    background: effectiveSisbov === s ? "#EAF3DE" : "#FFFFFF",
+                    border: effectiveSisbov === s ? "1.5px solid #639922" : "1px solid #E3E1D3",
+                    borderRadius: 10,
+                    padding: "9px 12px",
+                    marginBottom: 6,
+                    cursor: "pointer",
+                    fontFamily: "inherit",
+                    textAlign: "left",
+                  }}
+                >
+                  <EarTag>{s}</EarTag>
+                </button>
+              ))}
+            </div>
+          )}
+
+          {stats && (
+            <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px solid #EDEBDD" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
+                <EarTag>{effectiveSisbov}</EarTag>
+                <span style={{ fontWeight: 800, fontSize: 14, color: "#20241A" }}>
+                  {stats.total} medicação{stats.total === 1 ? "" : "ões"} registrada{stats.total === 1 ? "" : "s"}
+                </span>
+              </div>
+              {stats.motivosOrdenados.map(([motivo, count]) => (
+                <div
+                  key={motivo}
+                  style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 13, padding: "6px 0", borderBottom: "1px solid #EDEBDD" }}
+                >
+                  <span style={{ color: "#3A3D31", fontWeight: 600 }}>{motivo}</span>
+                  <span style={{ fontWeight: 800, color: "#2E4A2B" }}>{count}x</span>
+                </div>
+              ))}
+              {stats.ultima && (
+                <div style={{ fontSize: 11.5, color: "#9C9A88", marginTop: 8 }}>
+                  Última medicação em {fmtDate(stats.ultima.data)} · {stats.ultima.motivo}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function HistoricoTab({ lancamentos, onDelete, onUpdate, medicamentos, motivos, currais }) {
+  const [q, setQ] = useState("");
+  const [expanded, setExpanded] = useState(null);
+  const [editingId, setEditingId] = useState(null);
+  const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+  const [startDate, setStartDate] = useState(todayStr());
+  const [endDate, setEndDate] = useState(todayStr());
+  const [exportMsg, setExportMsg] = useState("");
+  const [showExport, setShowExport] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [fallbackCsv, setFallbackCsv] = useState("");
+
+  const inRange = useMemo(() => {
+    if (!startDate || !endDate) return [];
+    return lancamentos.filter((l) => l.data && l.data >= startDate && l.data <= endDate);
+  }, [lancamentos, startDate, endDate]);
+
+  const handleExport = async () => {
+    if (inRange.length === 0) {
+      setExportMsg("Nenhum lançamento encontrado nesse período.");
+      return;
+    }
+    setExportMsg("");
+    setFallbackCsv("");
+    const header = ["Identificacao", "Farmaco", "Dose", "Motivo", "Data", "Lote", "Modalidade", "Aplicador", "Protocolo", "Temperatura"];
+    const lines = [header.join(";")];
+    inRange
+      .slice()
+      .sort((a, b) => (a.data || "").localeCompare(b.data || ""))
+      .forEach((l) => {
+        const meds = l.medicamentos && l.medicamentos.length > 0 ? l.medicamentos : [{ medicamento: "", ml: "", lote: "" }];
+        meds.forEach((m) => {
+          const row = [
+            l.sisbov,
+            m.medicamento,
+            m.ml,
+            l.motivo,
+            fmtDate(l.data),
+            m.lote,
+            l.modalidade,
+            l.responsavel,
+            l.protocolo,
+            l.temperatura,
+          ];
+          lines.push(row.map(csvEscapeSemi).join(";"));
+        });
+      });
+    setExporting(true);
+    const csvContent = lines.join("\r\n");
+    const result = await shareOrDownloadFile(`relatorio_medicacao_${startDate}_a_${endDate}.csv`, csvContent);
+    setExporting(false);
+    if (result.ok) {
+      setExportMsg(result.method === "cancelled" ? "Envio cancelado." : `${inRange.length} lançamento(s) exportado(s).`);
+    } else {
+      setExportMsg("Não deu para baixar automaticamente neste navegador. Copie o texto abaixo:");
+      setFallbackCsv(csvContent);
+    }
+  };
+
+  const filtered = useMemo(() => {
+    if (!q.trim()) return lancamentos;
+    const t = q.trim().toLowerCase();
+    return lancamentos.filter(
+      (l) =>
+        l.sisbov?.includes(t) ||
+        l.motivo?.toLowerCase().includes(t) ||
+        l.responsavel?.toLowerCase().includes(t) ||
+        l.medicamentos?.some((m) => m.medicamento.toLowerCase().includes(t))
+    );
+  }, [lancamentos, q]);
+
+  return (
+    <div>
+      <QuickAnimalSearch lancamentos={lancamentos} />
+
+      <Card style={{ marginBottom: 14 }}>
+        <div
+          style={{ display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer" }}
+          onClick={() => setShowExport(!showExport)}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 700, fontSize: 14 }}>
+            <FileDown size={16} color="#2E4A2B" /> Extrair relatório de medicação
+          </div>
+          {showExport ? <ChevronUp size={16} color="#9C9A88" /> : <ChevronDown size={16} color="#9C9A88" />}
+        </div>
+        {showExport && (
+          <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid #EDEBDD" }}>
+            <div style={{ display: "flex", gap: 10 }}>
+              <div style={{ flex: 1 }}>
+                <Field label="Data inicial">
+                  <TextInput type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} />
+                </Field>
+              </div>
+              <div style={{ flex: 1 }}>
+                <Field label="Data final">
+                  <TextInput type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} />
+                </Field>
+              </div>
+            </div>
+            <div style={{ fontSize: 12, color: "#6B6A57", marginBottom: 10 }}>
+              {inRange.length} lançamento(s) encontrado(s) no período.
+            </div>
+            <Btn onClick={handleExport} disabled={exporting} style={{ width: "100%" }}>
+              {exporting ? <Loader2 size={15} style={{ animation: "spin 1s linear infinite" }} /> : <FileDown size={15} />}
+              {exporting ? "Gerando…" : "Extrair CSV"}
+            </Btn>
+            {exportMsg && (
+              <div style={{ fontSize: 12, color: fallbackCsv ? "#B5442E" : "#2E4A2B", marginTop: 8, display: "flex", alignItems: "center", gap: 6 }}>
+                {fallbackCsv ? <AlertCircle size={13} /> : <Check size={13} />} {exportMsg}
+              </div>
+            )}
+            {fallbackCsv && (
+              <div style={{ marginTop: 8 }}>
+                <TextArea
+                  readOnly
+                  value={fallbackCsv}
+                  onFocus={(e) => e.target.select()}
+                  style={{ minHeight: 140, fontSize: 11.5, fontFamily: "monospace" }}
+                />
+                <div style={{ fontSize: 11.5, color: "#9C9A88", marginTop: 4 }}>
+                  Toque na caixa acima, selecione tudo e copie — depois cole num app de Notas, WhatsApp ou Excel para salvar.
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </Card>
+
+      <div style={{ position: "relative", marginBottom: 14 }}>
+        <Search size={16} style={{ position: "absolute", left: 12, top: 13, color: "#9C9A88" }} />
+        <TextInput
+          placeholder="Buscar por SISBOV, motivo, responsável…"
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          style={{ paddingLeft: 36 }}
+        />
+      </div>
+
+      {filtered.length === 0 && (
+        <div style={{ textAlign: "center", color: "#9C9A88", padding: "40px 10px", fontSize: 14 }}>
+          {lancamentos.length === 0 ? "Nenhum lançamento registrado ainda." : "Nada encontrado para essa busca."}
+        </div>
+      )}
+
+      {filtered.map((l) => {
+        const isOpen = expanded === l.id;
+        return (
+          <Card key={l.id} style={{ marginBottom: 10 }}>
+            <div
+              style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", cursor: "pointer" }}
+              onClick={() => setExpanded(isOpen ? null : l.id)}
+            >
+              <div style={{ flex: 1 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
+                  <EarTag>{l.sisbov}</EarTag>
+                  <span style={{ fontSize: 12.5, color: "#6B6A57", fontWeight: 700 }}>{l.motivo}</span>
+                </div>
+                <div style={{ fontSize: 13, color: "#3A3D31" }}>
+                  {l.medicamentos?.map((m, i) => (
+                    <div key={i}>
+                      {m.medicamento} — {m.ml}ml{m.lote ? ` · lote ${m.lote}` : ""}
+                    </div>
+                  ))}
+                </div>
+              </div>
+              {isOpen ? <ChevronUp size={18} color="#9C9A88" /> : <ChevronDown size={18} color="#9C9A88" />}
+            </div>
+
+            {isOpen && editingId === l.id && (
+              <EditLancamentoForm
+                lancamento={l}
+                medicamentos={medicamentos}
+                motivos={motivos}
+                currais={currais}
+                onCancel={() => setEditingId(null)}
+                onSave={(patch) => {
+                  onUpdate(l.id, patch);
+                  setEditingId(null);
+                }}
+              />
+            )}
+
+            {isOpen && editingId !== l.id && (
+              <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid #EDEBDD", fontSize: 13, color: "#4A4E3F" }}>
+                <Row icon={<Calendar size={14} />} label="Data" value={fmtDate(l.data)} />
+                {l.destino && <Row icon={<MapPin size={14} />} label="Destino" value={l.destino} />}
+                {l.peso && <Row icon={<Weight size={14} />} label="Peso" value={`${l.peso} kg`} />}
+                {l.temperatura && <Row icon={<Thermometer size={14} />} label="Temperatura" value={`${l.temperatura} °C`} />}
+                {l.modalidade && <Row icon={<Syringe size={14} />} label="Modalidade" value={l.modalidade} />}
+                {l.protocolo && <Row icon={<ClipboardList size={14} />} label="Protocolo" value={l.protocolo} />}
+                <Row icon={<User size={14} />} label="Responsável" value={l.responsavel} />
+                {l.observacao && <Row icon={<MessageSquare size={14} />} label="Observação" value={l.observacao} />}
+                <div style={{ fontSize: 11.5, color: "#A9A791", marginTop: 8 }}>Registrado em {fmtDateTime(l.dataRegistro)}</div>
+
+                {confirmDeleteId !== l.id ? (
+                  <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setEditingId(l.id);
+                      }}
+                      style={{
+                        background: "transparent",
+                        border: "1.5px solid #C8C6B4",
+                        color: "#2E4A2B",
+                        borderRadius: 8,
+                        padding: "7px 12px",
+                        fontSize: 12.5,
+                        fontWeight: 700,
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: 6,
+                        cursor: "pointer",
+                        fontFamily: "inherit",
+                      }}
+                    >
+                      <Pencil size={14} /> Editar
+                    </button>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setConfirmDeleteId(l.id);
+                      }}
+                      style={{
+                        background: "transparent",
+                        border: "1.5px solid #E4C4BC",
+                        color: "#B5442E",
+                        borderRadius: 8,
+                        padding: "7px 12px",
+                        fontSize: 12.5,
+                        fontWeight: 700,
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: 6,
+                        cursor: "pointer",
+                        fontFamily: "inherit",
+                      }}
+                    >
+                      <Trash2 size={14} /> Remover
+                    </button>
+                  </div>
+                ) : (
+                  <div
+                    style={{
+                      marginTop: 10,
+                      padding: "10px 12px",
+                      background: "#FBF0EC",
+                      border: "1.5px solid #E4C4BC",
+                      borderRadius: 10,
+                    }}
+                  >
+                    <div style={{ display: "flex", alignItems: "center", gap: 6, color: "#B5442E", fontSize: 12.5, fontWeight: 700, marginBottom: 8 }}>
+                      <AlertCircle size={14} /> Remover este lançamento? Não dá para desfazer.
+                    </div>
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <Btn
+                        variant="danger"
+                        style={{ flex: 1, borderColor: "#B5442E", background: "#B5442E", color: "#fff" }}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onDelete(l.id);
+                          setConfirmDeleteId(null);
+                        }}
+                      >
+                        <Trash2 size={14} /> Sim, remover
+                      </Btn>
+                      <Btn
+                        variant="ghost"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setConfirmDeleteId(null);
+                        }}
+                      >
+                        Cancelar
+                      </Btn>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </Card>
+        );
+      })}
+    </div>
+  );
+}
+
+function Row({ icon, label, value }) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+      <span style={{ color: "#9C9A88" }}>{icon}</span>
+      <span style={{ color: "#8B8A78", minWidth: 88 }}>{label}</span>
+      <span style={{ fontWeight: 600 }}>{value}</span>
+    </div>
+  );
+}
+
+function Chip({ children, onRemove }) {
+  return (
+    <span
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 6,
+        background: "#EDEBDD",
+        color: "#3A3D31",
+        borderRadius: 8,
+        padding: "6px 8px 6px 10px",
+        fontSize: 13,
+        fontWeight: 600,
+        marginRight: 6,
+        marginBottom: 6,
+      }}
+    >
+      {children}
+      {onRemove && (
+        <button onClick={onRemove} aria-label="Remover" style={{ background: "transparent", border: "none", color: "#9C9A88", cursor: "pointer", display: "flex" }}>
+          <X size={13} />
+        </button>
+      )}
+    </span>
+  );
+}
+
+function AddRow({ placeholder, onAdd }) {
+  const [v, setV] = useState("");
+  return (
+    <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+      <TextInput
+        placeholder={placeholder}
+        value={v}
+        onChange={(e) => setV(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && v.trim()) {
+            onAdd(v);
+            setV("");
+          }
+        }}
+      />
+      <Btn
+        variant="accent"
+        onClick={() => {
+          if (v.trim()) {
+            onAdd(v);
+            setV("");
+          }
+        }}
+      >
+        <Plus size={16} />
+      </Btn>
+    </div>
+  );
+}
+
+function CadastrosTab({
+  medicamentos,
+  motivos,
+  currais,
+  addMedicamento,
+  removeMedicamento,
+  addLote,
+  removeLote,
+  addMotivo,
+  removeMotivo,
+  addCurral,
+  removeCurral,
+  animaisCount,
+  animaisSyncing,
+  animaisUpdatedAt,
+  onRefreshAnimais,
+  onImportAnimais,
+  usuarios,
+  addUsuario,
+  removeUsuario,
+}) {
+  const [openMed, setOpenMed] = useState(null);
+  const [showMedList, setShowMedList] = useState(false);
+  const [showMotivosList, setShowMotivosList] = useState(false);
+  const [novoUsuarioNome, setNovoUsuarioNome] = useState("");
+  const [novoUsuarioSenha, setNovoUsuarioSenha] = useState("");
+  const [usuarioError, setUsuarioError] = useState("");
+  const [showImport, setShowImport] = useState(false);
+  const [pasteText, setPasteText] = useState("");
+  const [importError, setImportError] = useState("");
+  const [fileName, setFileName] = useState("");
+  const [fileLineCount, setFileLineCount] = useState(0);
+  const fileContentRef = React.useRef("");
+  const fileInputRef = React.useRef(null);
+
+  const [quickError, setQuickError] = useState("");
+  const quickFileInputRef = React.useRef(null);
+
+  const handleQuickFile = (file) => {
+    if (!file) return;
+    setQuickError("");
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const text = String(e.target.result || "");
+      const { rows, error } = parseAnimaisCsv(text);
+      if (error) {
+        setQuickError(error);
+        return;
+      }
+      onImportAnimais(rows);
+    };
+    reader.onerror = () => setQuickError("Não consegui ler o arquivo. Tente novamente.");
+    reader.readAsText(file, "utf-8");
+    if (quickFileInputRef.current) quickFileInputRef.current.value = "";
+  };
+
+  const handleFile = (file) => {
+    if (!file) return;
+    setImportError("");
+    setPasteText("");
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const text = String(e.target.result || "");
+      fileContentRef.current = text;
+      setFileName(file.name);
+      setFileLineCount(text.split(/\r\n|\n|\r/).filter((l) => l.trim().length > 0).length);
+    };
+    reader.onerror = () => setImportError("Não consegui ler o arquivo. Tente novamente.");
+    reader.readAsText(file, "utf-8");
+  };
+
+  const clearFile = () => {
+    fileContentRef.current = "";
+    setFileName("");
+    setFileLineCount(0);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  };
+
+  const handleImport = () => {
+    setImportError("");
+    const text = fileName ? fileContentRef.current : pasteText;
+    if (!text.trim()) {
+      setImportError("Cole o texto ou selecione um arquivo CSV com ao menos uma linha.");
+      return;
+    }
+    const { rows, error } = parseAnimaisCsv(text);
+    if (error) {
+      setImportError(error);
+      return;
+    }
+    onImportAnimais(rows);
+    setPasteText("");
+    clearFile();
+    setShowImport(false);
+  };
+
+  const handleAddUsuario = () => {
+    setUsuarioError("");
+    const nome = novoUsuarioNome.trim();
+    const senha = novoUsuarioSenha.replace(/\D/g, "");
+    if (!nome) {
+      setUsuarioError("Digite o nome do responsável.");
+      return;
+    }
+    if (senha.length < 4) {
+      setUsuarioError("A senha precisa ter pelo menos 4 números.");
+      return;
+    }
+    addUsuario(nome, senha);
+    setNovoUsuarioNome("");
+    setNovoUsuarioSenha("");
+  };
+
+  return (
+    <div>
+      <SectionTitle>Medicamentos e lotes</SectionTitle>
+      <AddRow placeholder="Nome do medicamento" onAdd={addMedicamento} />
+      {medicamentos.length === 0 && <EmptyHint>Nenhum medicamento cadastrado.</EmptyHint>}
+      {medicamentos.length > 0 && (
+        <button
+          onClick={() => setShowMedList(!showMedList)}
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            width: "100%",
+            boxSizing: "border-box",
+            background: "#FFFFFF",
+            border: "1px solid #E3E1D3",
+            borderRadius: 10,
+            padding: "10px 12px",
+            marginBottom: 8,
+            cursor: "pointer",
+            fontFamily: "inherit",
+          }}
+        >
+          <span style={{ fontWeight: 700, fontSize: 14, color: "#20241A" }}>{medicamentos.length} medicamento(s) cadastrado(s)</span>
+          <span style={{ display: "flex", alignItems: "center", gap: 6, color: "#6B6A57", fontSize: 12.5, fontWeight: 700 }}>
+            {showMedList ? "ocultar" : "ver lista"}
+            {showMedList ? <ChevronUp size={16} color="#9C9A88" /> : <ChevronDown size={16} color="#9C9A88" />}
+          </span>
+        </button>
+      )}
+      {showMedList &&
+        medicamentos.map((m) => (
+        <Card key={m.nome} style={{ marginBottom: 8, padding: "10px 12px" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer" }} onClick={() => setOpenMed(openMed === m.nome ? null : m.nome)}>
+            <div style={{ fontWeight: 700, fontSize: 14 }}>{m.nome}</div>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <span style={{ fontSize: 12, color: "#9C9A88" }}>{m.lotes.length} lote(s)</span>
+              {openMed === m.nome ? <ChevronUp size={16} color="#9C9A88" /> : <ChevronDown size={16} color="#9C9A88" />}
+            </div>
+          </div>
+          {openMed === m.nome && (
+            <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px solid #EDEBDD" }}>
+              <div style={{ marginBottom: 8 }}>
+                {m.lotes.map((l) => (
+                  <Chip key={l} onRemove={() => removeLote(m.nome, l)}>
+                    {l}
+                  </Chip>
+                ))}
+                {m.lotes.length === 0 && <span style={{ fontSize: 12.5, color: "#A9A791" }}>Sem lotes ainda.</span>}
+              </div>
+              <AddRow placeholder="Novo lote" onAdd={(v) => addLote(m.nome, v)} />
+              <button
+                onClick={() => removeMedicamento(m.nome)}
+                style={{ background: "transparent", border: "none", color: "#B5442E", fontSize: 12.5, fontWeight: 700, cursor: "pointer", padding: 0, fontFamily: "inherit" }}
+              >
+                Remover medicamento
+              </button>
+            </div>
+          )}
+        </Card>
+      ))}
+
+      <SectionTitle>Motivos</SectionTitle>
+      <AddRow placeholder="Novo motivo" onAdd={addMotivo} />
+      {motivos.length === 0 && <EmptyHint>Nenhum motivo cadastrado.</EmptyHint>}
+      {motivos.length > 0 && (
+        <button
+          onClick={() => setShowMotivosList(!showMotivosList)}
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            width: "100%",
+            boxSizing: "border-box",
+            background: "#FFFFFF",
+            border: "1px solid #E3E1D3",
+            borderRadius: 10,
+            padding: "10px 12px",
+            marginBottom: 10,
+            cursor: "pointer",
+            fontFamily: "inherit",
+          }}
+        >
+          <span style={{ fontWeight: 700, fontSize: 14, color: "#20241A" }}>{motivos.length} motivo(s) cadastrado(s)</span>
+          <span style={{ display: "flex", alignItems: "center", gap: 6, color: "#6B6A57", fontSize: 12.5, fontWeight: 700 }}>
+            {showMotivosList ? "ocultar" : "ver lista"}
+            {showMotivosList ? <ChevronUp size={16} color="#9C9A88" /> : <ChevronDown size={16} color="#9C9A88" />}
+          </span>
+        </button>
+      )}
+      {showMotivosList && (
+        <div style={{ marginBottom: 10 }}>
+          {motivos.map((m) => (
+            <Chip key={m} onRemove={() => removeMotivo(m)}>
+              {m}
+            </Chip>
+          ))}
+        </div>
+      )}
+
+      <SectionTitle>Currais de destino</SectionTitle>
+      <AddRow placeholder="Novo curral" onAdd={addCurral} />
+      <div>
+        {currais.map((c) => (
+          <Chip key={c} onRemove={() => removeCurral(c)}>
+            {c}
+          </Chip>
+        ))}
+        {currais.length === 0 && <EmptyHint>Nenhum curral cadastrado.</EmptyHint>}
+      </div>
+
+      <SectionTitle>Banco de dados de SISBOV</SectionTitle>
+      <Card style={{ marginBottom: 8 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+          <div>
+            <div style={{ fontWeight: 700, fontSize: 14 }}>
+              {animaisCount === null ? "—" : animaisCount} animal(is) cadastrado(s)
+            </div>
+            {animaisUpdatedAt && (
+              <div style={{ fontSize: 11.5, color: "#9C9A88", marginTop: 2 }}>Atualizado em {fmtDateTime(animaisUpdatedAt)}</div>
+            )}
+          </div>
+          <Btn variant="ghost" onClick={onRefreshAnimais} disabled={animaisSyncing}>
+            {animaisSyncing ? <Loader2 size={15} style={{ animation: "spin 1s linear infinite" }} /> : <RefreshCw size={15} />}
+            Atualizar
+          </Btn>
+        </div>
+
+        <input
+          ref={quickFileInputRef}
+          type="file"
+          accept=".csv,text/csv,text/plain"
+          onChange={(e) => handleQuickFile(e.target.files?.[0])}
+          style={{ display: "none" }}
+        />
+        <Btn
+          variant="accent"
+          onClick={() => quickFileInputRef.current?.click()}
+          disabled={animaisSyncing}
+          style={{ width: "100%", marginTop: 10 }}
+        >
+          {animaisSyncing ? <Loader2 size={15} style={{ animation: "spin 1s linear infinite" }} /> : <FileUp size={15} />}
+          Extrair e atualizar via planilha CSV
+        </Btn>
+        <div style={{ fontSize: 11.5, color: "#9C9A88", marginTop: 6, textAlign: "center" }}>
+          Envia a planilha completa da fazenda e já extrai a coluna 4 (sisbov) e a coluna 45 (local atual) automaticamente. Isso <strong>substitui todo o banco de dados</strong> pelo conteúdo do arquivo enviado.
+        </div>
+        {quickError && (
+          <div style={{ display: "flex", alignItems: "center", gap: 6, color: "#B5442E", fontSize: 12.5, marginTop: 8 }}>
+            <AlertCircle size={14} /> {quickError}
+          </div>
+        )}
+
+        {!showImport ? (
+          <button
+            onClick={() => setShowImport(true)}
+            style={{
+              background: "transparent",
+              border: "none",
+              color: "#6B6A57",
+              fontSize: 12.5,
+              fontWeight: 700,
+              cursor: "pointer",
+              padding: 0,
+              marginTop: 12,
+              textDecoration: "underline",
+              fontFamily: "inherit",
+            }}
+          >
+            Ou colar dados manualmente
+          </button>
+        ) : (
+          <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px solid #EDEBDD" }}>
+            <div style={{ fontSize: 12.5, color: "#6B6A57", marginBottom: 8 }}>
+              Aceita a exportação completa do sistema da fazenda (identifica as colunas <strong>sisbov</strong> e <strong>local_atual</strong> automaticamente) ou um arquivo simples de duas colunas: <strong>sisbov, local_atual</strong> por linha. Isso <strong>substitui todo o banco de dados</strong> pelo conteúdo do arquivo enviado.
+            </div>
+
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".csv,text/csv,text/plain"
+              onChange={(e) => handleFile(e.target.files?.[0])}
+              style={{ display: "none" }}
+            />
+
+            {fileName ? (
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  width: "100%",
+                  boxSizing: "border-box",
+                  background: "#F3F4EC",
+                  border: "1.5px solid #C8C6B4",
+                  borderRadius: 10,
+                  padding: "10px 12px",
+                  marginBottom: 10,
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+                  <FileUp size={16} color="#4A4E3F" />
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: "#4A4E3F", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{fileName}</div>
+                    <div style={{ fontSize: 11.5, color: "#9C9A88" }}>{fileLineCount} linha(s) lida(s)</div>
+                  </div>
+                </div>
+                <button
+                  onClick={clearFile}
+                  aria-label="Remover arquivo"
+                  style={{ background: "transparent", border: "none", color: "#9C9A88", cursor: "pointer", flexShrink: 0 }}
+                >
+                  <X size={16} />
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  width: "100%",
+                  boxSizing: "border-box",
+                  background: "#F3F4EC",
+                  border: "1.5px dashed #C8C6B4",
+                  borderRadius: 10,
+                  padding: "12px 14px",
+                  color: "#4A4E3F",
+                  fontSize: 13.5,
+                  fontWeight: 700,
+                  cursor: "pointer",
+                  fontFamily: "inherit",
+                  marginBottom: 10,
+                }}
+              >
+                <FileUp size={16} />
+                Selecionar arquivo CSV
+              </button>
+            )}
+
+            {!fileName && (
+              <>
+                <div style={{ fontSize: 11.5, color: "#A9A791", textAlign: "center", margin: "4px 0 10px" }}>ou cole abaixo</div>
+                <TextArea
+                  placeholder={"105350216250010,EXD-15\n105350216250011,EXD-15"}
+                  value={pasteText}
+                  onChange={(e) => setPasteText(e.target.value)}
+                  style={{ minHeight: 110, marginBottom: 8 }}
+                />
+              </>
+            )}
+
+            {importError && (
+              <div style={{ display: "flex", alignItems: "center", gap: 6, color: "#B5442E", fontSize: 12.5, marginBottom: 8 }}>
+                <AlertCircle size={14} /> {importError}
+              </div>
+            )}
+            <div style={{ display: "flex", gap: 8 }}>
+              <Btn onClick={handleImport} disabled={animaisSyncing} style={{ flex: 1 }}>
+                {animaisSyncing ? <Loader2 size={15} style={{ animation: "spin 1s linear infinite" }} /> : <Check size={15} />}
+                Confirmar importação
+              </Btn>
+              <Btn
+                variant="ghost"
+                onClick={() => {
+                  setShowImport(false);
+                  setPasteText("");
+                  clearFile();
+                  setImportError("");
+                }}
+              >
+                <X size={15} />
+              </Btn>
+            </div>
+          </div>
+        )}
+      </Card>
+
+      <SectionTitle>Usuários responsáveis</SectionTitle>
+      <Card style={{ marginBottom: 8 }}>
+        <div style={{ fontSize: 12.5, color: "#6B6A57", marginBottom: 10 }}>
+          Cadastre uma senha numérica para cada funcionário. Ao abrir o app, ele escolhe o nome e digita a senha — o campo "Responsável" já vem preenchido sozinho.
+        </div>
+        {usuarios.length === 0 && <EmptyHint>Nenhum usuário cadastrado ainda.</EmptyHint>}
+        {usuarios.map((u) => (
+          <div
+            key={u.nome}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              padding: "8px 0",
+              borderBottom: "1px solid #EDEBDD",
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <UserCircle2 size={16} color="#2E4A2B" />
+              <span style={{ fontWeight: 700, fontSize: 13.5 }}>{u.nome}</span>
+              <span style={{ fontSize: 12, color: "#A9A791", letterSpacing: "0.15em" }}>••••</span>
+            </div>
+            <button
+              onClick={() => removeUsuario(u.nome)}
+              aria-label="Remover usuário"
+              style={{ background: "transparent", border: "none", color: "#B5442E", cursor: "pointer" }}
+            >
+              <Trash2 size={15} />
+            </button>
+          </div>
+        ))}
+
+        <div style={{ marginTop: 12, paddingTop: 12, borderTop: usuarios.length ? "none" : "1px solid #EDEBDD" }}>
+          <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+            <div style={{ flex: 1.3 }}>
+              <TextInput placeholder="Nome" value={novoUsuarioNome} onChange={(e) => setNovoUsuarioNome(e.target.value)} />
+            </div>
+            <div style={{ flex: 1 }}>
+              <TextInput
+                inputMode="numeric"
+                type="password"
+                placeholder="Senha"
+                value={novoUsuarioSenha}
+                onChange={(e) => setNovoUsuarioSenha(e.target.value.replace(/\D/g, ""))}
+              />
+            </div>
+          </div>
+          {usuarioError && (
+            <div style={{ display: "flex", alignItems: "center", gap: 6, color: "#B5442E", fontSize: 12.5, marginBottom: 8 }}>
+              <AlertCircle size={14} /> {usuarioError}
+            </div>
+          )}
+          <Btn variant="accent" onClick={handleAddUsuario} style={{ width: "100%" }}>
+            <Plus size={15} /> Cadastrar usuário
+          </Btn>
+        </div>
+      </Card>
+
+      <div style={{ marginTop: 24, padding: "12px 14px", background: "#EDEBDD", borderRadius: 10, fontSize: 12.5, color: "#6B6A57" }}>
+        Esses cadastros ficam salvos na nuvem e valem para todos que usam este app. Cadastre aqui os medicamentos, lotes, motivos e currais antes de começar a lançar.
+      </div>
+    </div>
+  );
+}
+
+function EmptyHint({ children }) {
+  return <div style={{ fontSize: 12.5, color: "#A9A791", marginBottom: 12 }}>{children}</div>;
+}
+
+// ---------- Inicialização ----------
+function ErroConexao({ mensagem }) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100vh", gap: 10, fontFamily: "system-ui, -apple-system, sans-serif", color: "#B5442E", textAlign: "center", padding: 20 }}>
+      <div>Não foi possível conectar ao Firebase. Recarregue a página.</div>
+      {mensagem && <div style={{ fontSize: 12, color: "#9C9A88", maxWidth: 340 }}>{mensagem}</div>}
+    </div>
+  );
+}
+
+function ConfigPendente() {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100vh", gap: 10, fontFamily: "system-ui, -apple-system, sans-serif", color: "#6B6A57", textAlign: "center", padding: 24 }}>
+      <div style={{ fontWeight: 800, fontSize: 16, color: "#20241A" }}>Configuração do Firebase pendente</div>
+      <div style={{ fontSize: 13.5, maxWidth: 360 }}>
+        Edite este arquivo e preencha o objeto <code>firebaseConfig</code>, perto do topo do
+        script, com os valores do seu projeto Firebase. Veja o passo a passo no README.md.
+      </div>
+    </div>
+  );
+}
+
+(async function init() {
+  const root = ReactDOM.createRoot(document.getElementById("root"));
+  if (!firebaseConfig.apiKey || firebaseConfig.apiKey.indexOf("COLE_AQUI") !== -1) {
+    root.render(<ConfigPendente />);
+    return;
+  }
+  try {
+    firebase.initializeApp(firebaseConfig);
+    // Login anônimo: exige apenas que "Anonymous" esteja ativado em
+    // Authentication > Sign-in method no console do Firebase. Isso, combinado
+    // com regras do Firestore que exigem "request.auth != null", impede que
+    // qualquer visitante aleatório da internet leia ou apague os dados —
+    // mesmo com o firebaseConfig público no GitHub (veja o README.md).
+    await firebase.auth().signInAnonymously();
+    const firestore = firebase.firestore();
+    window.storage = makeStorageShim(firestore);
+    root.render(<App />);
+  } catch (e) {
+    console.error(e);
+    root.render(<ErroConexao mensagem={e && e.message} />);
+  }
+})();
+</script>
+</body>
+</html>
