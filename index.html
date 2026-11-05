@@ -233,6 +233,687 @@ async function hashPin(pin) {
   return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+// ---------- Histórico de sanidade (importado do sistema da fazenda) ----------
+// Alimenta só os relatórios (pesquisa por animal e por medicamento). Não vira
+// lançamento editável. Fica guardado em blocos compactos, como o banco de SISBOV.
+function stripAccents(s) {
+  return String(s == null ? "" : s).normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+}
+function normKey(s) {
+  return stripAccents(s).toUpperCase().replace(/\s+/g, " ").trim();
+}
+const DAY0 = Date.UTC(2025, 0, 1);
+function isoToDay(iso) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(iso || ""));
+  if (!m) return null;
+  return Math.round((Date.UTC(+m[1], +m[2] - 1, +m[3]) - DAY0) / 86400000);
+}
+function dayToIso(day) {
+  return new Date(DAY0 + day * 86400000).toISOString().slice(0, 10);
+}
+function parseDataAplicacao(s) {
+  s = String(s || "").trim();
+  let m = /^(\d{2})\/(\d{2})\/(\d{4})/.exec(s);
+  if (m) return isoToDay(m[3] + "-" + m[2] + "-" + m[1]);
+  m = /^(\d{4})-(\d{2})-(\d{2})/.exec(s);
+  return m ? isoToDay(s) : null;
+}
+// Arquivos exportados pelo Excel/sistemas antigos costumam vir em Windows-1252
+// (acentos quebram se lidos como UTF-8). Tenta UTF-8 estrito e cai para 1252.
+function decodeCsvBuffer(buf) {
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(buf);
+  } catch (e) {
+    return new TextDecoder("windows-1252").decode(buf);
+  }
+}
+const PROTO_PREFIX = "PROTOCOLO: ";
+
+// Busca pelo final do SISBOV. Primeiro tenta COM o dígito verificador (o número
+// digitado são os últimos dígitos do SISBOV inteiro). Se nenhum animal terminar
+// assim, tenta pelo manejo SEM o dígito verificador: esses resultados vêm
+// marcados (semDv) e nunca são escolhidos sozinhos — o usuário confirma qual.
+function buscarAnimais(animaisMap, query) {
+  if (!query) return [];
+  if (query.length >= 15) {
+    const curral = animaisMap[query];
+    return curral !== undefined ? [{ sisbov: query, curral }] : [];
+  }
+  const entries = Object.entries(animaisMap);
+  const comDv = entries.filter(([sisbov]) => sisbov.endsWith(query)).map(([sisbov, curral]) => ({ sisbov, curral }));
+  if (comDv.length > 0) return comDv;
+  return entries
+    .filter(([sisbov]) => sisbov.slice(0, -1).endsWith(query))
+    .map(([sisbov, curral]) => ({ sisbov, curral, semDv: true }));
+}
+
+// Histórico de um animal (aba Lançar): todas as aplicações já registradas,
+// lançamentos do app + histórico de sanidade importado, mais recentes primeiro.
+// Aplicação do histórico que já existe como lançamento (mesmo animal, data e
+// motivo) não aparece duas vezes.
+function computeAnimalHistory(sisbov, lancamentos, sanidade) {
+  const itens = [];
+  const liveKeys = new Set();
+  (lancamentos || []).forEach((l) => {
+    if (l.sisbov !== sisbov) return;
+    const motivo = normKey(l.motivo) || "SEM MOTIVO";
+    const d = isoToDay(l.data);
+    if (d !== null) liveKeys.add(d + "|" + motivo);
+    itens.push({
+      iso: String(l.data || "").slice(0, 10),
+      motivo,
+      protocolo: false,
+      origem: "app",
+      ts: l.dataRegistro || 0,
+      meds: (l.medicamentos || []).map((m) => ({ nome: m.medicamento, ml: m.ml })),
+    });
+  });
+  const evs = (sanidade && sanidade.byAnimal[sisbov]) || [];
+  evs.forEach((ev) => {
+    const label = sanidade.meta.labels[ev[1]] || "SEM MOTIVO";
+    if (liveKeys.has(ev[0] + "|" + label)) return;
+    const meds = [];
+    for (let j = 2; j < ev.length; j++) meds.push({ nome: sanidade.meta.farmacos[ev[j]] });
+    itens.push({ iso: dayToIso(ev[0]), motivo: label, protocolo: label.indexOf(PROTO_PREFIX) === 0, origem: "historico", ts: 0, meds });
+  });
+  itens.sort((a, b) => (a.iso < b.iso ? 1 : a.iso > b.iso ? -1 : (b.ts || 0) - (a.ts || 0)));
+  return itens;
+}
+const SANIDADE_CHUNK_CHARS = 150000;
+
+function buildSanidade(text, opts) {
+  const lines = text.split(/\r\n|\n|\r/);
+  let hi = 0;
+  while (hi < lines.length && !lines[hi].trim()) hi++;
+  if (hi >= lines.length) return { error: "Arquivo vazio." };
+  const delim = detectDelimiter(lines[hi]);
+  const header = splitCsvLine(lines[hi], delim).map(normalizeHeader);
+  const iS = header.indexOf("sisbov");
+  const iF = header.indexOf("farmaco");
+  const iD = header.indexOf("data_aplicacao");
+  const iM = header.indexOf("motivo");
+  const iP = header.indexOf("protocolo_sanitario");
+  if (iS < 0 || iF < 0 || iD < 0 || iM < 0) {
+    return { error: "Não encontrei as colunas sisbov, farmaco, data_aplicacao e motivo. Confira se é o arquivo de sanidade." };
+  }
+
+  const labels = [], labelIdx = new Map();
+  const farmacos = [], farmIdx = new Map();
+  const byAnimal = new Map();
+  let rows = 0, events = 0, skipped = 0, dayMin = Infinity, dayMax = -Infinity;
+
+  for (let i = hi + 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line || !line.trim()) continue;
+    const c = line.indexOf('"') === -1 ? line.split(delim) : splitCsvLine(line, delim);
+    const sisbov = (c[iS] || "").replace(/\D/g, "");
+    const day = parseDataAplicacao(c[iD]);
+    const farm = normKey(c[iF]);
+    if (!sisbov || day === null || !farm) {
+      skipped++;
+      continue;
+    }
+    const mot = normKey(c[iM]);
+    const prot = iP >= 0 ? normKey(c[iP]) : "";
+    const label = mot || (prot ? PROTO_PREFIX + prot : "SEM MOTIVO");
+
+    let li = labelIdx.get(label);
+    if (li === undefined) {
+      li = labels.length;
+      labels.push(label);
+      labelIdx.set(label, li);
+    }
+    let fi = farmIdx.get(farm);
+    if (fi === undefined) {
+      fi = farmacos.length;
+      farmacos.push(farm);
+      farmIdx.set(farm, fi);
+    }
+    let evs = byAnimal.get(sisbov);
+    if (!evs) {
+      evs = new Map();
+      byAnimal.set(sisbov, evs);
+    }
+    // Um "evento" = mesmo animal, mesma data e mesmo motivo/protocolo
+    // (várias linhas de fármacos do mesmo atendimento viram um evento só).
+    const ek = day + "|" + li;
+    let ev = evs.get(ek);
+    if (!ev) {
+      ev = [day, li];
+      evs.set(ek, ev);
+      events++;
+    }
+    if (ev.indexOf(fi, 2) === -1) ev.push(fi);
+    rows++;
+    if (day < dayMin) dayMin = day;
+    if (day > dayMax) dayMax = day;
+  }
+
+  if (rows === 0) return { error: "Não encontrei nenhuma linha válida no arquivo." };
+
+  if (opts && opts.noChunks) {
+    const obj = {};
+    byAnimal.forEach((evMap, s) => {
+      obj[s] = Array.from(evMap.values());
+    });
+    return { byAnimal: obj, meta: { labels, farmacos, rows, events, animals: byAnimal.size, dayMin, dayMax, skipped } };
+  }
+
+  const chunks = [];
+  let cur = {}, curLen = 2, curCount = 0;
+  byAnimal.forEach((evMap, s) => {
+    const arr = Array.from(evMap.values());
+    const len = s.length + 5 + JSON.stringify(arr).length;
+    if (curCount > 0 && curLen + len > SANIDADE_CHUNK_CHARS) {
+      chunks.push(cur);
+      cur = {};
+      curLen = 2;
+      curCount = 0;
+    }
+    cur[s] = arr;
+    curLen += len;
+    curCount++;
+  });
+  if (curCount > 0) chunks.push(cur);
+
+  return { chunks, meta: { labels, farmacos, rows, events, animals: byAnimal.size, dayMin, dayMax, skipped } };
+}
+
+// Relatório por animal: junta os lançamentos do app com o histórico importado.
+// Evento do histórico que já existe como lançamento (mesmo animal, data e
+// motivo) não é contado duas vezes — as linhas "WEB" do sistema da fazenda
+// costumam ser justamente os lançamentos feitos no app.
+function computeAnimalStats(sisbov, lancamentos, sanidade) {
+  const porMotivo = {};
+  const liveKeys = new Set();
+  let ultTrat = null, ultProt = null, nLive = 0, nHist = 0;
+  lancamentos.forEach((l) => {
+    if (l.sisbov !== sisbov) return;
+    nLive++;
+    const m = normKey(l.motivo) || "SEM MOTIVO";
+    porMotivo[m] = (porMotivo[m] || 0) + 1;
+    const d = isoToDay(l.data);
+    if (d !== null) liveKeys.add(d + "|" + m);
+    const iso = String(l.data || "").slice(0, 10);
+    if (iso && (!ultTrat || iso > ultTrat.iso)) ultTrat = { iso, motivo: m };
+  });
+  const evs = (sanidade && sanidade.byAnimal[sisbov]) || [];
+  evs.forEach((ev) => {
+    const label = sanidade.meta.labels[ev[1]] || "SEM MOTIVO";
+    if (liveKeys.has(ev[0] + "|" + label)) return;
+    nHist++;
+    porMotivo[label] = (porMotivo[label] || 0) + 1;
+    const iso = dayToIso(ev[0]);
+    if (label.indexOf(PROTO_PREFIX) === 0) {
+      if (!ultProt || iso > ultProt.iso) ultProt = { iso, motivo: label };
+    } else if (!ultTrat || iso > ultTrat.iso) {
+      ultTrat = { iso, motivo: label };
+    }
+  });
+  const entries = Object.entries(porMotivo);
+  const tratamentos = entries.filter(([k]) => k.indexOf(PROTO_PREFIX) !== 0).sort((a, b) => b[1] - a[1]);
+  const protocolos = entries.filter(([k]) => k.indexOf(PROTO_PREFIX) === 0).sort((a, b) => b[1] - a[1]);
+  const nTrat = tratamentos.reduce((s, e) => s + e[1], 0);
+  const nProt = protocolos.reduce((s, e) => s + e[1], 0);
+  return { total: nTrat + nProt, nLive, nHist, nTrat, nProt, tratamentos, protocolos, ultimo: ultTrat || ultProt };
+}
+
+// Relatório por medicamento (selKey = nome normalizado com normKey).
+function computeMedStats(selKey, lancamentos, sanidade) {
+  const porMotivo = {};
+  const liveKeys = new Set();
+  let nLive = 0, nHist = 0;
+  lancamentos.forEach((l) => {
+    const has = l.medicamentos && l.medicamentos.some((m) => normKey(m.medicamento) === selKey);
+    if (!has) return;
+    const m = normKey(l.motivo) || "SEM MOTIVO";
+    nLive++;
+    porMotivo[m] = (porMotivo[m] || 0) + 1;
+    const d = isoToDay(l.data);
+    if (d !== null) liveKeys.add(l.sisbov + "|" + d + "|" + m);
+  });
+  if (sanidade) {
+    const fi = sanidade.meta.farmacos.findIndex((f) => normKey(f) === selKey);
+    if (fi >= 0) {
+      const labels = sanidade.meta.labels;
+      const byA = sanidade.byAnimal;
+      for (const s in byA) {
+        const evs = byA[s];
+        for (let k = 0; k < evs.length; k++) {
+          const ev = evs[k];
+          let has = false;
+          for (let j = 2; j < ev.length; j++) {
+            if (ev[j] === fi) {
+              has = true;
+              break;
+            }
+          }
+          if (!has) continue;
+          const label = labels[ev[1]] || "SEM MOTIVO";
+          if (liveKeys.has(s + "|" + ev[0] + "|" + label)) continue;
+          nHist++;
+          porMotivo[label] = (porMotivo[label] || 0) + 1;
+        }
+      }
+    }
+  }
+  const entries = Object.entries(porMotivo);
+  const tratamentos = entries.filter(([k]) => k.indexOf(PROTO_PREFIX) !== 0).sort((a, b) => b[1] - a[1]);
+  const protocolos = entries.filter(([k]) => k.indexOf(PROTO_PREFIX) === 0).sort((a, b) => b[1] - a[1]);
+  return { total: nLive + nHist, nLive, nHist, tratamentos, protocolos };
+}
+
+
+// ---------- Banco de dados vindo de arquivos do próprio site (GitHub → Render) ----------
+// ANIMAIS_APK e sanidade ficam na raiz do repositório (como .csv OU .zip) e são
+// publicados pelo Render junto com o app. O resultado já processado fica guardado
+// neste aparelho (IndexedDB) e só é refeito quando o arquivo muda. Nada vai para a nuvem.
+const NOMES_PADRAO = {
+  animais: ["ANIMAIS_APK.csv", "ANIMAIS_APK.zip", "animais_apk.csv", "animais_apk.zip", "animais.csv", "animais.zip"],
+  sanidade: ["sanidade.csv", "sanidade.zip", "SANIDADE.csv", "SANIDADE.zip"],
+};
+const IDB_NAME = "controle-medicamentos-dados";
+const mb = (n) => (n / 1048576).toFixed(1).replace(".", ",");
+
+let idbPromise = null;
+function idbOpen() {
+  // Uma única conexão reaproveitada (não abre uma nova a cada leitura).
+  if (!idbPromise) {
+    idbPromise = new Promise((resolve) => {
+      try {
+        const req = indexedDB.open(IDB_NAME, 1);
+        req.onupgradeneeded = () => req.result.createObjectStore("datasets");
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => resolve(null);
+        req.onblocked = () => resolve(null);
+      } catch (e) {
+        resolve(null);
+      }
+    });
+  }
+  return idbPromise;
+}
+async function idbGet(key) {
+  const db = await idbOpen();
+  if (!db) return null;
+  return new Promise((resolve) => {
+    try {
+      const r = db.transaction("datasets", "readonly").objectStore("datasets").get(key);
+      r.onsuccess = () => resolve(r.result || null);
+      r.onerror = () => resolve(null);
+    } catch (e) {
+      resolve(null);
+    }
+  });
+}
+async function idbSet(key, val) {
+  const db = await idbOpen();
+  if (!db) return false;
+  return new Promise((resolve) => {
+    try {
+      const tx = db.transaction("datasets", "readwrite");
+      tx.objectStore("datasets").put(val, key);
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = () => resolve(false);
+      tx.onabort = () => resolve(false);
+    } catch (e) {
+      resolve(false);
+    }
+  });
+}
+
+async function fetchManifest() {
+  try {
+    const r = await fetch("manifest.json", { cache: "no-cache" });
+    if (r.status === 404) return { dados: {}, estado: "não existe (é opcional)" };
+    if (!r.ok) return { dados: {}, estado: `erro ${r.status}` };
+    const j = await r.json();
+    return { dados: j && typeof j === "object" ? j : {}, estado: "ok" };
+  } catch (e) {
+    return { dados: {}, estado: "falhou: " + ((e && e.message) || e) };
+  }
+}
+
+// O site está respondendo? (qualquer resposta HTTP serve, até 404.) Separa "sem internet"
+// de "o navegador bloqueou/derrubou o download de um arquivo específico".
+async function siteAlcancavel() {
+  try {
+    await fetch("manifest.json", { cache: "no-store" });
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+// Uma nova tentativa rápida: falhas de rede passageiras são comuns no celular.
+async function fetchComRetry(url) {
+  try {
+    return await fetch(url, { cache: "no-cache" });
+  } catch (e) {
+    await new Promise((r) => setTimeout(r, 300));
+    return await fetch(url, { cache: "no-cache" });
+  }
+}
+
+// Nome de arquivo informado no manifest.json (só aceita .csv/.zip simples).
+function nomeArquivoSeguro(entry) {
+  const n = entry && typeof entry.arquivo === "string" ? entry.arquivo.trim() : "";
+  return /^[A-Za-z0-9_][A-Za-z0-9_.\- ()]*\.(csv|zip)$/i.test(n) ? n : "";
+}
+// Nomes que o app procura no site (na raiz e na pasta "dados/"), na ordem.
+function listaDeArquivos(kind, manifestEntry) {
+  const extra = nomeArquivoSeguro(manifestEntry);
+  const base = Array.from(new Set((extra ? [extra] : []).concat(NOMES_PADRAO[kind])));
+  return base.concat(base.map((n) => "dados/" + n));
+}
+
+// ---- .zip (o do Windows: "Enviar para > Pasta compactada") lido no próprio navegador ----
+function ehZip(buf) {
+  const u = new Uint8Array(buf);
+  return u.length > 4 && u[0] === 0x50 && u[1] === 0x4b && u[2] === 0x03 && u[3] === 0x04;
+}
+function pareceHtml(buf) {
+  const head = new TextDecoder("utf-8").decode(new Uint8Array(buf, 0, Math.min(buf.byteLength, 300))).trimStart().toLowerCase();
+  return head.indexOf("<!doctype html") === 0 || head.indexOf("<html") === 0;
+}
+async function inflarRaw(u8) {
+  if (typeof DecompressionStream === "undefined") {
+    throw new Error("este navegador não abre .zip — use o arquivo .csv");
+  }
+  const stream = new Response(u8).body.pipeThrough(new DecompressionStream("deflate-raw"));
+  return await new Response(stream).arrayBuffer();
+}
+async function extrairCsvDoZip(buf) {
+  const u = new Uint8Array(buf);
+  const dv = new DataView(buf);
+  let eocd = -1;
+  for (let i = u.length - 22; i >= Math.max(0, u.length - 65557); i--) {
+    if (dv.getUint32(i, true) === 0x06054b50) {
+      eocd = i;
+      break;
+    }
+  }
+  if (eocd < 0) throw new Error("zip inválido");
+  const total = dv.getUint16(eocd + 10, true);
+  let p = dv.getUint32(eocd + 16, true);
+  const entradas = [];
+  for (let n = 0; n < total; n++) {
+    if (dv.getUint32(p, true) !== 0x02014b50) throw new Error("zip inválido");
+    const metodo = dv.getUint16(p + 10, true);
+    const tamComp = dv.getUint32(p + 20, true);
+    const nomeLen = dv.getUint16(p + 28, true);
+    const extraLen = dv.getUint16(p + 30, true);
+    const comLen = dv.getUint16(p + 32, true);
+    const offLocal = dv.getUint32(p + 42, true);
+    const nome = new TextDecoder("utf-8").decode(u.subarray(p + 46, p + 46 + nomeLen));
+    entradas.push({ nome, metodo, tamComp, offLocal });
+    p += 46 + nomeLen + extraLen + comLen;
+  }
+  const util = entradas.filter((e) => !/\/$/.test(e.nome) && e.nome.indexOf("__MACOSX/") !== 0 && !/(^|\/)\._/.test(e.nome));
+  const alvo = util.find((e) => /\.csv$/i.test(e.nome)) || util[0];
+  if (!alvo) throw new Error("o zip está vazio");
+  if (alvo.tamComp === 0xffffffff) throw new Error("zip grande demais");
+  if (dv.getUint32(alvo.offLocal, true) !== 0x04034b50) throw new Error("zip inválido");
+  const ini = alvo.offLocal + 30 + dv.getUint16(alvo.offLocal + 26, true) + dv.getUint16(alvo.offLocal + 28, true);
+  const dados = u.subarray(ini, ini + alvo.tamComp);
+  if (alvo.metodo === 0) return dados.slice().buffer;
+  if (alvo.metodo === 8) return await inflarRaw(dados);
+  throw new Error("tipo de compressão não suportado");
+}
+
+// Baixa o corpo da resposta mostrando o andamento.
+async function lerCorpo(resp, aoAndar) {
+  if (!resp.body || !resp.body.getReader) return await resp.arrayBuffer();
+  const reader = resp.body.getReader();
+  const partes = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    partes.push(value);
+    total += value.length;
+    if (aoAndar) aoAndar(total);
+  }
+  const out = new Uint8Array(total);
+  let o = 0;
+  partes.forEach((pt) => {
+    out.set(pt, o);
+    o += pt.length;
+  });
+  return out.buffer;
+}
+
+function parseAnimaisFile(text) {
+  const { rows, error } = parseAnimaisCsv(text);
+  if (error) return { error };
+  // SISBOV tem 15 dígitos: linhas com números curtos não são animais (evita aceitar planilha errada).
+  const validos = rows.filter((r) => r.sisbov.length >= 12);
+  if (validos.length === 0) {
+    return { error: "não achei nenhum SISBOV (número de 15 dígitos) — confira se é a planilha de animais." };
+  }
+  const map = {};
+  validos.forEach((r) => {
+    map[r.sisbov] = r.curral || null;
+  });
+  return { data: { map, count: validos.length } };
+}
+function parseSanidadeFile(text) {
+  const b = buildSanidade(text, { noChunks: true });
+  if (b.error) return { error: b.error };
+  return { data: { meta: b.meta, byAnimal: b.byAnimal } };
+}
+
+// Data exibida como "atualizado em": a mais recente entre a data do manifest.json
+// e a data do arquivo no servidor (Last-Modified). Sem nenhuma das duas, usa o
+// momento em que esta versão do arquivo foi vista pela primeira vez neste aparelho.
+function dataAtualizacao(rec, lastModMs, manifestMs) {
+  const c = [manifestMs, lastModMs].filter((v) => Number.isFinite(v));
+  return c.length ? Math.max(...c) : rec.firstSeen || Date.now();
+}
+
+function mensagemDeErro(nomes, tentativas) {
+  const inval = tentativas.find((t) => t.resultado.indexOf("formato inválido") === 0 || t.resultado.indexOf("não consegui abrir") === 0);
+  if (inval) return `${inval.arquivo}: ${inval.resultado}`;
+  const html = tentativas.find((t) => t.resultado.indexOf("página HTML") >= 0);
+  if (html) {
+    return `O site devolveu a página do app no lugar de ${html.arquivo}. No Render, veja em Redirects/Rewrites se existe uma regra mandando tudo para /index.html e apague-a.`;
+  }
+  const falha = tentativas.find((t) => t.resultado.indexOf("falha ao baixar") === 0);
+  if (falha) {
+    return `Não consegui baixar ${falha.arquivo} (${falha.resultado.replace("falha ao baixar — ", "")}), embora o site esteja respondendo. Algo neste aparelho ou rede está bloqueando o arquivo: tente o .zip (bem menor) ou use o "Plano B" abaixo.`;
+  }
+  if (tentativas.some((t) => t.resultado.indexOf("sem conexão") === 0)) {
+    return `Sem conexão com o site para baixar ${nomes[0]}. Confira a internet do aparelho (se já houver dados guardados nele, o app usa esses).`;
+  }
+  return `Não encontrei ${nomes[0]} (nem a versão .zip) no site. Suba o arquivo no GitHub, na mesma pasta do index.html.`;
+}
+
+// Procura e carrega o arquivo de um tipo ("animais" ou "sanidade") no site.
+async function carregarDoSite(kind, parse, manifestEntry, force, onProgress) {
+  const cached = await idbGet(kind);
+  const nomes = listaDeArquivos(kind, manifestEntry);
+  const ordem = cached && cached.file && nomes.indexOf(cached.file) >= 0 ? [cached.file].concat(nomes.filter((n) => n !== cached.file)) : nomes;
+  const stamp = (manifestEntry && manifestEntry.atualizado_em) || "";
+  const manifestMs = Date.parse(stamp);
+  const tentativas = [];
+  let semRede = false;
+  for (const file of ordem) {
+    let resp;
+    try {
+      resp = await fetchComRetry(file);
+    } catch (e) {
+      const motivo = `${(e && e.name) || "Erro"}: ${(e && e.message) || e}`;
+      if (!(await siteAlcancavel())) {
+        tentativas.push({ arquivo: file, resultado: `sem conexão (${motivo})` });
+        semRede = true;
+        break;
+      }
+      tentativas.push({ arquivo: file, resultado: `falha ao baixar — ${motivo}` });
+      continue;
+    }
+    if (resp.status === 404) {
+      tentativas.push({ arquivo: file, resultado: "não existe (404)" });
+      continue;
+    }
+    if (!resp.ok) {
+      tentativas.push({ arquivo: file, resultado: `erro ${resp.status} do servidor` });
+      continue;
+    }
+    const etag = resp.headers.get("etag") || "";
+    const lastModMs = Date.parse(resp.headers.get("last-modified") || "");
+    const usable = cached && cached.file === file ? cached : null;
+    const doCache = (rec, atualizar) => ({
+      data: rec.data, updatedAt: atualizar, arquivo: file, bytes: rec.bytes, via: rec.via, tentativas,
+    });
+
+    // Mesmo arquivo de antes (mesmo ETag e mesma data no manifest): reaproveita o que já foi processado.
+    if (usable && !force && etag && usable.etag === etag && usable.manifestStamp === stamp) {
+      try {
+        if (resp.body) resp.body.cancel();
+      } catch (e) {}
+      tentativas.push({ arquivo: file, resultado: "sem mudanças — usando o que já está guardado neste aparelho" });
+      return doCache(usable, dataAtualizacao(usable, lastModMs, manifestMs));
+    }
+
+    if (onProgress) onProgress(`Baixando ${file}…`);
+    let buf;
+    try {
+      buf = await lerCorpo(resp, (got) => onProgress && onProgress(`Baixando ${file}… ${mb(got)} MB`));
+    } catch (e) {
+      tentativas.push({ arquivo: file, resultado: `falha ao baixar — a conexão caiu no meio (${(e && e.message) || e})` });
+      continue;
+    }
+    if (pareceHtml(buf)) {
+      tentativas.push({ arquivo: file, resultado: "o site devolveu uma página HTML, não o arquivo" });
+      continue;
+    }
+    // Servidor mandou outro ETag, mas o conteúdo tem o mesmo tamanho: não reprocessa.
+    if (usable && !force && usable.byteLength === buf.byteLength && usable.manifestStamp === stamp) {
+      const rec = { ...usable, etag, updatedAt: dataAtualizacao(usable, lastModMs, manifestMs) };
+      idbSet(kind, rec);
+      tentativas.push({ arquivo: file, resultado: "sem mudanças — usando o que já está guardado neste aparelho" });
+      return doCache(rec, rec.updatedAt);
+    }
+
+    let csvBuf = buf;
+    let via = "csv";
+    if (ehZip(buf)) {
+      if (onProgress) onProgress(`Abrindo ${file}…`);
+      try {
+        csvBuf = await extrairCsvDoZip(buf);
+        via = "zip";
+      } catch (e) {
+        tentativas.push({ arquivo: file, resultado: "não consegui abrir o zip: " + e.message });
+        continue;
+      }
+    }
+    if (onProgress) onProgress(`Processando ${file}…`);
+    await new Promise((r) => setTimeout(r, 0)); // deixa a tela atualizar antes do trabalho pesado
+    const parsed = parse(decodeCsvBuffer(csvBuf));
+    if (parsed.error) {
+      tentativas.push({ arquivo: file, resultado: "formato inválido — " + parsed.error });
+      continue;
+    }
+    const rec = { file, etag, byteLength: buf.byteLength, bytes: buf.byteLength, via, manifestStamp: stamp, firstSeen: Date.now(), data: parsed.data };
+    rec.updatedAt = dataAtualizacao(rec, lastModMs, manifestMs);
+    await idbSet(kind, rec);
+    tentativas.push({ arquivo: file, resultado: `ok · ${mb(buf.byteLength)} MB${via === "zip" ? " (zip)" : ""}` });
+    return doCache(rec, rec.updatedAt);
+  }
+  // Sem rede / servidor com problema, mas já há dados guardados neste aparelho: usa-os.
+  if (cached && cached.data && (semRede || tentativas.some((t) => /^erro \d+/.test(t.resultado)))) {
+    return { data: cached.data, updatedAt: cached.updatedAt, arquivo: cached.file, bytes: cached.bytes, via: cached.via, offline: true, tentativas };
+  }
+  const err = new Error(mensagemDeErro(nomes, tentativas));
+  err.tentativas = tentativas;
+  throw err;
+}
+
+// ---- Plano B: arquivo escolhido direto neste aparelho (não passa por GitHub nem nuvem) ----
+function detectarTipo(text) {
+  const primeira = text.split(/\r\n|\n|\r/).find((l) => l.trim()) || "";
+  const h = splitCsvLine(primeira, detectDelimiter(primeira)).map(normalizeHeader);
+  if (h.indexOf("farmaco") >= 0 && h.indexOf("data_aplicacao") >= 0) return "sanidade";
+  if (h.indexOf("sisbov") >= 0 || h.length > 44) return "animais";
+  return null;
+}
+async function carregarArquivosLocais(files, onProgress) {
+  const res = [];
+  for (const f of files) {
+    try {
+      if (onProgress) onProgress(`Lendo ${f.name}…`);
+      const buf = await f.arrayBuffer();
+      const zip = ehZip(buf);
+      const text = decodeCsvBuffer(zip ? await extrairCsvDoZip(buf) : buf);
+      const tipo = detectarTipo(text);
+      if (!tipo) {
+        res.push({ ok: false, nome: f.name, msg: `${f.name}: não reconheci o arquivo (esperava a planilha de animais ou a de sanidade).` });
+        continue;
+      }
+      if (onProgress) onProgress(`Processando ${f.name}…`);
+      await new Promise((r) => setTimeout(r, 0));
+      const parsed = (tipo === "animais" ? parseAnimaisFile : parseSanidadeFile)(text);
+      if (parsed.error) {
+        res.push({ ok: false, nome: f.name, msg: `${f.name}: ${parsed.error}` });
+        continue;
+      }
+      const rec = { file: f.name, byteLength: buf.byteLength, bytes: buf.byteLength, via: zip ? "zip" : "csv", firstSeen: Date.now(), updatedAt: f.lastModified || Date.now(), data: parsed.data, manual: true };
+      await idbSet(tipo + "_manual", rec);
+      res.push({ ok: true, nome: f.name, tipo, msg: `${tipo === "animais" ? "Animais" : "Sanidade"} carregado neste aparelho (${f.name}).` });
+    } catch (e) {
+      console.error("Erro ao ler arquivo do aparelho:", e);
+      res.push({ ok: false, nome: f.name, msg: `${f.name}: não consegui ler o arquivo (${e.message}).` });
+    }
+  }
+  return res;
+}
+async function limparArquivosLocais() {
+  await idbSet("animais_manual", null);
+  await idbSet("sanidade_manual", null);
+}
+
+async function loadStaticDatasets(force, onProgress) {
+  const mf = await fetchManifest();
+  const manifest = mf.dados;
+  const wrap = (p) => p.then((r) => ({ r }), (e) => ({ e }));
+  const [sa, ss] = await Promise.all([
+    wrap(carregarDoSite("animais", parseAnimaisFile, manifest.animais, force, onProgress)),
+    wrap(carregarDoSite("sanidade", parseSanidadeFile, manifest.sanidade, force, onProgress)),
+  ]);
+  const [ma, ms] = await Promise.all([idbGet("animais_manual"), idbGet("sanidade_manual")]);
+  const out = {
+    animaisMap: {}, animaisUpdatedAt: null, sanidade: null, errors: {}, offline: false, diag: {}, fontes: {},
+    contexto: {
+      origem: typeof location !== "undefined" ? location.origin : "",
+      protocolo: typeof location !== "undefined" ? location.protocol : "",
+      online: typeof navigator !== "undefined" ? navigator.onLine : true,
+      manifest: mf.estado,
+    },
+  };
+  // Fonte escolhida: o arquivo do aparelho só vale se for mais novo que o do site (ou se o site não tiver).
+  const escolher = (kind, site, manual) => {
+    out.diag[kind] = site.r ? site.r.tentativas : (site.e && site.e.tentativas) || [];
+    if (manual && manual.data && (!site.r || manual.updatedAt >= site.r.updatedAt)) {
+      out.fontes[kind] = { origem: "aparelho", arquivo: manual.file, bytes: manual.bytes, via: manual.via };
+      return { data: manual.data, updatedAt: manual.updatedAt };
+    }
+    if (site.r) {
+      if (site.r.offline) out.offline = true;
+      out.fontes[kind] = { origem: "site", arquivo: site.r.arquivo, bytes: site.r.bytes, via: site.r.via };
+      return { data: site.r.data, updatedAt: site.r.updatedAt };
+    }
+    out.errors[kind] = (site.e && site.e.message) || "Não consegui carregar o arquivo.";
+    return null;
+  };
+  const A = escolher("animais", sa, ma);
+  if (A) {
+    out.animaisMap = A.data.map;
+    out.animaisUpdatedAt = A.updatedAt;
+  }
+  const S = escolher("sanidade", ss, ms);
+  if (S) out.sanidade = { meta: { ...S.data.meta, updatedAt: S.updatedAt }, byAnimal: S.data.byAnimal };
+  return out;
+}
+
 const uid = () => `${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
 const todayStr = () => new Date().toISOString().slice(0, 10);
 const fmtDate = (iso) => {
@@ -596,8 +1277,12 @@ function App() {
   const [currais, setCurrais] = useState([]);
   const [lancamentos, setLancamentos] = useState([]);
   const [animaisMap, setAnimaisMap] = useState({});
-  const [animaisSyncing, setAnimaisSyncing] = useState(false);
+  const [datasetsLoading, setDatasetsLoading] = useState(false);
+  const [datasetErrors, setDatasetErrors] = useState({});
+  const [datasetsStatus, setDatasetsStatus] = useState("");
+  const [datasetInfo, setDatasetInfo] = useState({ diag: {}, fontes: {}, offline: false });
   const [animaisUpdatedAt, setAnimaisUpdatedAt] = useState(null);
+  const [sanidade, setSanidade] = useState(null);
   const [usuarios, setUsuarios] = useState([]);
   const [currentUser, setCurrentUser] = useState(null);
 
@@ -631,37 +1316,6 @@ function App() {
       setMotivos(motList);
       setCurrais(curR ? safeJsonParse(curR.value, []) : []);
       setUsuarios(usrR ? safeJsonParse(usrR.value, []) : []);
-
-      // Nas atualizações automáticas em segundo plano (silent), pulamos a
-      // releitura dos blocos de animais: eles são grandes e re-lê-los a
-      // cada 45s consumiria a cota gratuita de leituras do Firestore rápido
-      // demais. O banco de SISBOV só é recarregado na abertura do app ou no
-      // botão "Atualizar" manual.
-      if (silent) {
-        // nada a fazer aqui — animaisMap/animaisUpdatedAt permanecem como estão
-      } else {
-      const animIdxR = await window.storage.get("cfg:animais_index", true).catch(() => null);
-      if (animIdxR) {
-        try {
-          const idx = safeJsonParse(animIdxR.value, {});
-          const chunkKeys = Array.from({ length: idx.chunkCount || 0 }, (_, i) => `animais:chunk:${i}`);
-          const chunkResults = await Promise.all(chunkKeys.map((k) => window.storage.get(k, true).catch(() => null)));
-          const merged = {};
-          chunkResults.forEach((r) => {
-            if (r) {
-              try {
-                Object.assign(merged, JSON.parse(r.value));
-              } catch {}
-            }
-          });
-          setAnimaisMap(merged);
-          setAnimaisUpdatedAt(idx.updatedAt || null);
-        } catch {}
-      } else {
-        setAnimaisMap({});
-        setAnimaisUpdatedAt(null);
-      }
-      }
 
       const idx = await window.storage.list("lanc:", true).catch(() => null);
       if (idx && idx.keys && idx.keys.length) {
@@ -700,6 +1354,33 @@ function App() {
     }, 45000);
     return () => clearInterval(t);
   }, [loadAll]);
+
+  // Banco de dados (animais + sanidade) vem dos arquivos publicados junto com o app.
+  const loadDatasets = useCallback(async (force) => {
+    setDatasetsLoading(true);
+    setDatasetsStatus("Carregando banco de animais e histórico…");
+    let errs = {};
+    try {
+      const ds = await loadStaticDatasets(!!force, setDatasetsStatus);
+      setAnimaisMap(ds.animaisMap);
+      setAnimaisUpdatedAt(ds.animaisUpdatedAt);
+      setSanidade(ds.sanidade);
+      setDatasetInfo({ diag: ds.diag, fontes: ds.fontes, offline: ds.offline, contexto: ds.contexto });
+      errs = ds.errors;
+    } catch (e) {
+      console.error("Falha ao carregar o banco de dados:", e);
+      errs = { geral: "Não consegui carregar o banco de dados. Recarregue a página." };
+    } finally {
+      setDatasetErrors(errs);
+      setDatasetsLoading(false);
+      setDatasetsStatus("");
+    }
+    return errs;
+  }, []);
+
+  useEffect(() => {
+    loadDatasets(false);
+  }, [loadDatasets]);
 
   const saveConfig = async (key, value, setter) => {
     setter(value);
@@ -761,87 +1442,41 @@ function App() {
   };
   const logout = () => setCurrentUser(null);
 
-  const ANIMAIS_CHUNK_SIZE = 3000;
+  // Recarrega os arquivos do site, ignorando o que já está guardado neste aparelho.
+  const reloadDatasets = async () => {
+    const errs = await loadDatasets(true);
+    const msgs = Object.values(errs || {});
+    if (msgs.length) showToast(msgs[0], "err");
+    else showToast("Banco de dados recarregado dos arquivos do site.");
+  };
 
-  const refreshAnimais = async () => {
-    setAnimaisSyncing(true);
+  // Plano B: usa arquivos escolhidos neste aparelho (não passa por GitHub nem nuvem).
+  const loadLocalFiles = async (fileList) => {
+    const files = Array.from(fileList || []);
+    if (!files.length) return;
+    setDatasetsLoading(true);
+    setDatasetsStatus("Lendo arquivos do aparelho…");
+    let res = [];
     try {
-      const animIdxR = await window.storage.get("cfg:animais_index", true).catch(() => null);
-      if (animIdxR) {
-        const idx = safeJsonParse(animIdxR.value, {});
-        const chunkKeys = Array.from({ length: idx.chunkCount || 0 }, (_, i) => `animais:chunk:${i}`);
-        const chunkResults = await Promise.all(chunkKeys.map((k) => window.storage.get(k, true).catch(() => null)));
-        const merged = {};
-        chunkResults.forEach((r) => {
-          if (r) {
-            try {
-              Object.assign(merged, JSON.parse(r.value));
-            } catch {}
-          }
-        });
-        setAnimaisMap(merged);
-        setAnimaisUpdatedAt(idx.updatedAt || null);
-        showToast("Banco de dados de SISBOV atualizado.");
-      } else {
-        setAnimaisMap({});
-        setAnimaisUpdatedAt(null);
-        showToast("Nenhum animal cadastrado ainda.");
-      }
+      res = await carregarArquivosLocais(files, setDatasetsStatus);
     } catch (e) {
-      console.error("Falha ao atualizar banco de animais:", e);
-      showToast("Falha ao atualizar o banco de dados.", "err");
-    } finally {
-      setAnimaisSyncing(false);
+      console.error(e);
+      res = [{ ok: false, msg: "Não consegui ler os arquivos." }];
     }
+    await loadDatasets(false);
+    const ruim = res.find((r) => !r.ok);
+    if (ruim) showToast(ruim.msg, "err");
+    else showToast(res.map((r) => r.msg).join(" "));
+  };
+  const clearLocalFiles = async () => {
+    await limparArquivosLocais();
+    await loadDatasets(false);
+    showToast("Voltei a usar só os arquivos do site.");
   };
 
-  const importAnimais = async (rows) => {
-    setAnimaisSyncing(true);
-    try {
-      const fresh = {};
-      rows.forEach((r) => {
-        fresh[r.sisbov] = r.curral || null;
-      });
-      const entries = Object.entries(fresh);
-      const chunkCount = Math.max(1, Math.ceil(entries.length / ANIMAIS_CHUNK_SIZE));
+  const lookupAnimais = useCallback((query) => buscarAnimais(animaisMap, query), [animaisMap]);
 
-      for (let i = 0; i < chunkCount; i++) {
-        const chunkObj = Object.fromEntries(entries.slice(i * ANIMAIS_CHUNK_SIZE, (i + 1) * ANIMAIS_CHUNK_SIZE));
-        await window.storage.set(`animais:chunk:${i}`, JSON.stringify(chunkObj), true);
-      }
-
-      const oldIdxR = await window.storage.get("cfg:animais_index", true).catch(() => null);
-      const oldChunkCount = oldIdxR ? safeJsonParse(oldIdxR.value, {}).chunkCount || 0 : 0;
-      for (let i = chunkCount; i < oldChunkCount; i++) {
-        await window.storage.delete(`animais:chunk:${i}`, true).catch(() => {});
-      }
-
-      const meta = { chunkCount, updatedAt: Date.now(), count: entries.length };
-      await window.storage.set("cfg:animais_index", JSON.stringify(meta), true);
-      setAnimaisMap(fresh);
-      setAnimaisUpdatedAt(meta.updatedAt);
-      showToast(`Banco de dados substituído: ${entries.length} animal(is) na versão atual.`);
-    } catch (e) {
-      console.error("Falha ao importar animais:", e);
-      showToast("Falha ao importar os animais.", "err");
-    } finally {
-      setAnimaisSyncing(false);
-    }
-  };
-
-  const lookupAnimais = (query) => {
-    if (!query) return [];
-    const entries = Object.entries(animaisMap);
-    if (query.length >= 15) {
-      const curral = animaisMap[query];
-      return curral !== undefined ? [{ sisbov: query, curral }] : [];
-    }
-    // Ignora o dígito verificador (último dígito do SISBOV): a busca passa a
-    // considerar só o número de manejo. Se isso resultar em mais de um
-    // animal, o chamador (LancarTab/HistoricoTab) mostra a lista para o
-    // usuário escolher qual é o correto.
-    return entries.filter(([sisbov]) => sisbov.slice(0, -1).endsWith(query)).map(([sisbov, curral]) => ({ sisbov, curral }));
-  };
+  const animaisCount = useMemo(() => Object.keys(animaisMap).length, [animaisMap]);
 
   const addLancamento = async (rec) => {
     setSaving(true);
@@ -865,6 +1500,24 @@ function App() {
       showToast("Lançamento removido.");
     } catch {
       showToast("Falha ao remover.", "err");
+    }
+  };
+
+  // Marca (ts) ou desmarca (null) lançamentos como "já exportados / lançados no sistema".
+  // semLote=true: marcação avulsa de um lançamento (não entra no "desfazer última exportação").
+  const marcarExportados = async (ids, ts, semLote) => {
+    const alvo = lancamentos.filter((l) => ids.indexOf(l.id) >= 0);
+    if (!alvo.length) return true;
+    try {
+      const novos = alvo.map((l) => ({ ...l, exportadoEm: ts, exportLote: semLote ? null : ts }));
+      await Promise.all(novos.map((n) => window.storage.set(n.id, JSON.stringify(n), true)));
+      const porId = new Map(novos.map((n) => [n.id, n]));
+      setLancamentos((prev) => prev.map((l) => porId.get(l.id) || l));
+      return true;
+    } catch (e) {
+      console.error("Falha ao atualizar a marcação de exportados:", e);
+      showToast("Falha ao atualizar a marcação de exportados. Tente de novo.", "err");
+      return false;
     }
   };
 
@@ -954,6 +1607,11 @@ function App() {
             lookupAnimais={lookupAnimais}
             currentUser={currentUser}
             animaisUpdatedAt={animaisUpdatedAt}
+            sanidadeUpdatedAt={sanidade && sanidade.meta ? sanidade.meta.updatedAt : null}
+            lancamentos={lancamentos}
+            sanidade={sanidade}
+            bancoCarregando={datasetsLoading ? datasetsStatus || true : false}
+            avisoBanco={[datasetErrors.animais, datasetErrors.sanidade, datasetErrors.geral].filter(Boolean).join(" ")}
           />
         )}
         {tab === "historico" && (
@@ -961,6 +1619,8 @@ function App() {
             lancamentos={lancamentos}
             onDelete={deleteLancamento}
             onUpdate={updateLancamento}
+            onMarkExported={marcarExportados}
+            sanidade={sanidade}
             medicamentos={medicamentos}
             motivos={motivos}
             currais={currais}
@@ -979,11 +1639,16 @@ function App() {
             removeMotivo={removeMotivo}
             addCurral={addCurral}
             removeCurral={removeCurral}
-            animaisCount={Object.keys(animaisMap).length}
-            animaisSyncing={animaisSyncing}
+            animaisCount={animaisCount}
             animaisUpdatedAt={animaisUpdatedAt}
-            onRefreshAnimais={refreshAnimais}
-            onImportAnimais={importAnimais}
+            sanidade={sanidade}
+            datasetsLoading={datasetsLoading}
+            datasetsStatus={datasetsStatus}
+            datasetErrors={datasetErrors}
+            datasetInfo={datasetInfo}
+            onReloadDatasets={reloadDatasets}
+            onLoadLocalFiles={loadLocalFiles}
+            onClearLocalFiles={clearLocalFiles}
             usuarios={usuarios}
             addUsuario={addUsuario}
             removeUsuario={removeUsuario}
@@ -1060,7 +1725,67 @@ function emptyMedSlot() {
   return { medicamento: "", lote: "", ml: "" };
 }
 
-function LancarTab({ medicamentos, motivos, currais, onSubmit, saving, addMotivo, addCurral, lookupAnimais, currentUser, animaisUpdatedAt }) {
+// Painel "Histórico" da aba Lançar: mostra se o animal já foi medicado, quando
+// e com qual medicamento (lançamentos do app + histórico de sanidade).
+function HistoricoAnimal({ sisbov, lancamentos, sanidade }) {
+  const [verTodos, setVerTodos] = useState(false);
+  const itens = useMemo(() => computeAnimalHistory(sisbov, lancamentos, sanidade), [sisbov, lancamentos, sanidade]);
+  const LIMITE = 6;
+  const visiveis = verTodos ? itens : itens.slice(0, LIMITE);
+  const nomeMeds = (it) => it.meds.map((m) => (m.ml ? `${m.nome} ${m.ml} ml` : m.nome)).join(", ") || "—";
+
+  if (itens.length === 0) {
+    return (
+      <div style={{ background: "#EAF3DE", border: "1.5px solid #B7D79A", borderRadius: 12, padding: "10px 12px", marginBottom: 14 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, fontWeight: 800, color: "#2E4A2B", textTransform: "uppercase", letterSpacing: "0.05em" }}>
+          <ClipboardList size={14} /> Histórico
+        </div>
+        <div style={{ fontSize: 13.5, color: "#2E4A2B", fontWeight: 700, marginTop: 4 }}>Nenhuma medicação registrada para este animal.</div>
+        {!sanidade && <div style={{ fontSize: 11.5, color: "#6B6A57", marginTop: 2 }}>(o histórico de sanidade não está carregado)</div>}
+      </div>
+    );
+  }
+
+  const nTrat = itens.filter((i) => !i.protocolo).length;
+  const nProt = itens.length - nTrat;
+  const ultimo = itens[0];
+  return (
+    <div style={{ background: "#FBF3E0", border: "1.5px solid #E8C97A", borderRadius: 12, padding: "10px 12px 6px", marginBottom: 14 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, fontWeight: 800, color: "#7A5A12", textTransform: "uppercase", letterSpacing: "0.05em" }}>
+        <ClipboardList size={14} /> Histórico
+      </div>
+      <div style={{ fontSize: 14, color: "#20241A", fontWeight: 800, marginTop: 4 }}>
+        Já medicado: {itens.length} {itens.length === 1 ? "registro" : "registros"}
+      </div>
+      <div style={{ fontSize: 11.5, color: "#6B6A57", marginBottom: 6 }}>
+        {nTrat} tratamento{nTrat === 1 ? "" : "s"} · {nProt} de protocolo sanitário · última em {fmtDate(ultimo.iso)}
+      </div>
+      {visiveis.map((it, i) => (
+        <div key={i} style={{ padding: "7px 0", borderTop: "1px solid #F0E3BE" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 8, fontSize: 12.5 }}>
+            <span style={{ fontWeight: 800, color: "#20241A" }}>{fmtDate(it.iso)}</span>
+            <span style={{ color: "#6B6A57", fontWeight: 700, textAlign: "right" }}>
+              {it.protocolo ? "Protocolo: " : ""}
+              {motivoNome(it.motivo)}
+            </span>
+          </div>
+          <div style={{ fontSize: 13, color: "#3A3D31" }}>{nomeMeds(it)}</div>
+        </div>
+      ))}
+      {itens.length > LIMITE && (
+        <button
+          type="button"
+          onClick={() => setVerTodos(!verTodos)}
+          style={{ background: "transparent", border: "none", color: "#7A5A12", fontWeight: 800, fontSize: 12.5, cursor: "pointer", padding: "6px 0 8px", fontFamily: "inherit" }}
+        >
+          {verTodos ? "Mostrar menos" : `Ver todos (${itens.length})`}
+        </button>
+      )}
+    </div>
+  );
+}
+
+function LancarTab({ medicamentos, motivos, currais, onSubmit, saving, addMotivo, addCurral, lookupAnimais, currentUser, animaisUpdatedAt, sanidadeUpdatedAt, lancamentos, sanidade, bancoCarregando, avisoBanco }) {
   const [data, setData] = useState(todayStr());
   const [sisbov, setSisbov] = useState("");
   const [motivo, setMotivo] = useState("");
@@ -1114,7 +1839,7 @@ function LancarTab({ medicamentos, motivos, currais, onSubmit, saving, addMotivo
       const found = lookupAnimais(digits);
       if (!cancelled) {
         setMatches(found);
-        if (found.length === 1) setSelectedAnimal(found[0]);
+        if (found.length === 1 && !found[0].semDv) setSelectedAnimal(found[0]);
         setCheckingAnimal(false);
       }
     }, 400);
@@ -1130,7 +1855,7 @@ function LancarTab({ medicamentos, motivos, currais, onSubmit, saving, addMotivo
     const e = {};
     if (!data) e.data = true;
     if (!finalSisbov || finalSisbov.length < 5) e.sisbov = true;
-    if (matches.length > 1 && !selectedAnimal) e.sisbov = true;
+    if (matches.length >= 1 && !selectedAnimal) e.sisbov = true;
     if (!motivo) e.motivo = true;
     if (!slots[0].medicamento || !slots[0].ml) e.slot0 = true;
     if (!responsavel.trim()) e.responsavel = true;
@@ -1158,7 +1883,18 @@ function LancarTab({ medicamentos, motivos, currais, onSubmit, saving, addMotivo
 
   return (
     <div>
-      {animaisUpdatedAt && (
+      {bancoCarregando && (
+        <div style={{ display: "flex", alignItems: "center", gap: 6, background: "#EDEBDD", color: "#6B6A57", fontSize: 11.5, fontWeight: 700, borderRadius: 8, padding: "7px 10px", marginBottom: 10 }}>
+          <Loader2 size={12} style={{ animation: "spin 1s linear infinite" }} />{" "}
+          {typeof bancoCarregando === "string" ? bancoCarregando : "Carregando banco de animais e histórico…"}
+        </div>
+      )}
+      {avisoBanco && (
+        <div style={{ display: "flex", alignItems: "flex-start", gap: 6, background: "#FBF0EC", color: "#B5442E", fontSize: 12, fontWeight: 700, borderRadius: 8, padding: "8px 10px", marginBottom: 10 }}>
+          <AlertCircle size={14} /> <span>{avisoBanco}</span>
+        </div>
+      )}
+      {(animaisUpdatedAt || sanidadeUpdatedAt) && (
         <div
           style={{
             display: "flex",
@@ -1173,7 +1909,12 @@ function LancarTab({ medicamentos, motivos, currais, onSubmit, saving, addMotivo
             marginBottom: 14,
           }}
         >
-          <RefreshCw size={12} /> Banco de SISBOV atualizado em {fmtDateTime(animaisUpdatedAt)}
+          <RefreshCw size={12} />
+          <span>
+            {animaisUpdatedAt ? `Banco de SISBOV atualizado em ${fmtDateTime(animaisUpdatedAt)}` : ""}
+            {animaisUpdatedAt && sanidadeUpdatedAt ? " · " : ""}
+            {sanidadeUpdatedAt ? `Sanidade atualizada em ${fmtDateTime(sanidadeUpdatedAt)}` : ""}
+          </span>
         </div>
       )}
 
@@ -1181,10 +1922,10 @@ function LancarTab({ medicamentos, motivos, currais, onSubmit, saving, addMotivo
         <TextInput type="date" value={data} onChange={(e) => setData(e.target.value)} style={errors.data ? errStyle : {}} />
       </Field>
 
-      <Field label="SISBOV do animal" required hint="Digite os últimos números do manejo (sem o dígito verificador)">
+      <Field label="SISBOV do animal" required hint="Digite os 6 últimos números do manejo + o dígito verificador (último número)">
         <TextInput
           inputMode="numeric"
-          placeholder="Ex: 674745"
+          placeholder="Ex: 6747453"
           value={sisbov}
           onChange={(e) => setSisbov(e.target.value.replace(/[^\d]/g, ""))}
           style={errors.sisbov ? errStyle : {}}
@@ -1195,36 +1936,51 @@ function LancarTab({ medicamentos, motivos, currais, onSubmit, saving, addMotivo
           </div>
         )}
 
-        {!checkingAnimal && matches.length > 1 && (
+        {!checkingAnimal && (matches.length > 1 || (matches.length === 1 && !selectedAnimal)) && (
           <div style={{ marginTop: 8 }}>
-            <div style={{ fontSize: 12, color: "#B5442E", fontWeight: 700, marginBottom: 6, display: "flex", alignItems: "center", gap: 5 }}>
-              <AlertCircle size={13} /> {matches.length} animais encontram com esses números. Escolha qual vai medicar:
+            <div style={{ fontSize: 12, color: "#B5442E", fontWeight: 700, marginBottom: 6, display: "flex", alignItems: "flex-start", gap: 5 }}>
+              <AlertCircle size={13} />
+              <span>
+                {matches.some((m) => m.semDv)
+                  ? "Nenhum animal termina com esse número (com o dígito verificador). Achei pelo manejo, sem o dígito verificador — confirme qual vai lançar:"
+                  : `${matches.length} animais encontrados com esses números. Escolha qual vai lançar:`}
+              </span>
             </div>
-            {matches.map((m) => (
-              <button
-                key={m.sisbov}
-                type="button"
-                onClick={() => setSelectedAnimal(m)}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  width: "100%",
-                  boxSizing: "border-box",
-                  background: selectedAnimal?.sisbov === m.sisbov ? "#EAF3DE" : "#FFFFFF",
-                  border: selectedAnimal?.sisbov === m.sisbov ? "1.5px solid #639922" : "1px solid #E3E1D3",
-                  borderRadius: 10,
-                  padding: "9px 12px",
-                  marginBottom: 6,
-                  cursor: "pointer",
-                  fontFamily: "inherit",
-                  textAlign: "left",
-                }}
-              >
-                <EarTag>{m.sisbov}</EarTag>
-                <span style={{ fontSize: 12.5, color: "#4A4E3F", fontWeight: 600 }}>{m.curral ? `local: ${m.curral}` : "sem local atual"}</span>
-              </button>
-            ))}
+            {matches.slice(0, 30).map((m) => {
+              const nMed = computeAnimalHistory(m.sisbov, lancamentos, sanidade).length;
+              return (
+                <button
+                  key={m.sisbov}
+                  type="button"
+                  onClick={() => setSelectedAnimal(m)}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: 8,
+                    width: "100%",
+                    boxSizing: "border-box",
+                    background: selectedAnimal?.sisbov === m.sisbov ? "#EAF3DE" : "#FFFFFF",
+                    border: selectedAnimal?.sisbov === m.sisbov ? "1.5px solid #639922" : "1px solid #E3E1D3",
+                    borderRadius: 10,
+                    padding: "9px 12px",
+                    marginBottom: 6,
+                    cursor: "pointer",
+                    fontFamily: "inherit",
+                    textAlign: "left",
+                  }}
+                >
+                  <EarTag>{m.sisbov}</EarTag>
+                  <span style={{ fontSize: 12.5, color: "#4A4E3F", fontWeight: 600, textAlign: "right" }}>
+                    {m.curral ? `local: ${m.curral}` : "sem local atual"}
+                    {nMed > 0 ? ` · ${nMed} medicaç${nMed === 1 ? "ão" : "ões"}` : ""}
+                  </span>
+                </button>
+              );
+            })}
+            {matches.length > 30 && (
+              <div style={{ fontSize: 11.5, color: "#9C9A88" }}>Mostrando 30 de {matches.length} — digite mais números para filtrar.</div>
+            )}
           </div>
         )}
 
@@ -1249,9 +2005,15 @@ function LancarTab({ medicamentos, motivos, currais, onSubmit, saving, addMotivo
         )}
 
         {!checkingAnimal && matches.length === 0 && sisbov.replace(/\D/g, "").length >= 5 && (
-          <div style={{ fontSize: 11.5, color: "#A9A791", marginTop: 4 }}>Animal não encontrado no banco de dados de SISBOV.</div>
+          <div style={{ fontSize: 11.5, color: "#A9A791", marginTop: 4 }}>
+            {bancoCarregando ? "O banco de animais ainda está carregando — aguarde um instante." : "Animal não encontrado no banco de dados de SISBOV."}
+          </div>
         )}
       </Field>
+
+      {!checkingAnimal && selectedAnimal && (
+        <HistoricoAnimal sisbov={selectedAnimal.sisbov} lancamentos={lancamentos} sanidade={sanidade} />
+      )}
 
       <Field label="Motivo" required>
         {!novoMotivo ? (
@@ -1517,6 +2279,161 @@ function csvEscapeSemi(value) {
   return s;
 }
 
+// ---------- Relatório em Excel (.xlsx): SISBOV como NÚMERO inteiro ----------
+// Um CSV não guarda o tipo da célula (o Excel mostra o SISBOV como 1,05E+14). No .xlsx
+// o SISBOV é uma célula numérica com formato "0" (aparece inteiro, sem notação científica).
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+function crc32(u8) {
+  let c = 0xffffffff;
+  for (let i = 0; i < u8.length; i++) c = CRC_TABLE[(c ^ u8[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+function zipSemCompressao(arquivos) {
+  const enc = new TextEncoder();
+  const partes = [];
+  const central = [];
+  let offset = 0;
+  arquivos.forEach((a) => {
+    const nome = enc.encode(a.nome);
+    const crc = crc32(a.dados);
+    const lh = new DataView(new ArrayBuffer(30));
+    lh.setUint32(0, 0x04034b50, true);
+    lh.setUint16(4, 20, true);
+    lh.setUint16(6, 0x0800, true);
+    lh.setUint16(12, 0x21, true);
+    lh.setUint32(14, crc, true);
+    lh.setUint32(18, a.dados.length, true);
+    lh.setUint32(22, a.dados.length, true);
+    lh.setUint16(26, nome.length, true);
+    partes.push(new Uint8Array(lh.buffer), nome, a.dados);
+    const ch = new DataView(new ArrayBuffer(46));
+    ch.setUint32(0, 0x02014b50, true);
+    ch.setUint16(4, 20, true);
+    ch.setUint16(6, 20, true);
+    ch.setUint16(8, 0x0800, true);
+    ch.setUint16(14, 0x21, true);
+    ch.setUint32(16, crc, true);
+    ch.setUint32(20, a.dados.length, true);
+    ch.setUint32(24, a.dados.length, true);
+    ch.setUint16(28, nome.length, true);
+    ch.setUint32(42, offset, true);
+    central.push(new Uint8Array(ch.buffer), nome);
+    offset += 30 + nome.length + a.dados.length;
+  });
+  const cdTam = central.reduce((s, p) => s + p.length, 0);
+  const eo = new DataView(new ArrayBuffer(22));
+  eo.setUint32(0, 0x06054b50, true);
+  eo.setUint16(8, arquivos.length, true);
+  eo.setUint16(10, arquivos.length, true);
+  eo.setUint32(12, cdTam, true);
+  eo.setUint32(16, offset, true);
+  const todas = partes.concat(central, [new Uint8Array(eo.buffer)]);
+  const out = new Uint8Array(todas.reduce((s, p) => s + p.length, 0));
+  let o = 0;
+  todas.forEach((p) => {
+    out.set(p, o);
+    o += p.length;
+  });
+  return out;
+}
+function xmlEsc(s) {
+  return String(s)
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+// tipo "num0": inteiro com formato 0 (SISBOV) · "numtxt": número se for numérico simples, senão texto · "txt": texto
+function celulaXlsx(ref, v, tipo) {
+  if (v === null || v === undefined || v === "") return "";
+  if (tipo === "num0") {
+    const d = String(v).replace(/\D/g, "");
+    if (d) return `<c r="${ref}" s="1"><v>${d}</v></c>`;
+  }
+  if (tipo === "numtxt" && /^(0|[1-9]\d*)([.,]\d+)?$/.test(String(v).trim())) {
+    return `<c r="${ref}"><v>${Number(String(v).trim().replace(",", "."))}</v></c>`;
+  }
+  return `<c r="${ref}" t="inlineStr"><is><t xml:space="preserve">${xmlEsc(v)}</t></is></c>`;
+}
+function montarXlsx(cabecalho, linhas, tipos) {
+  const enc = new TextEncoder();
+  const letra = (i) => String.fromCharCode(65 + i);
+  const cab = `<row r="1">${cabecalho.map((h, i) => `<c r="${letra(i)}1" s="2" t="inlineStr"><is><t>${xmlEsc(h)}</t></is></c>`).join("")}</row>`;
+  const corpo = linhas
+    .map((l, r) => `<row r="${r + 2}">${l.map((v, i) => celulaXlsx(letra(i) + (r + 2), v, tipos[i])).join("")}</row>`)
+    .join("");
+  const NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+  const REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+  const X = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
+  const arq = (nome, txt) => ({ nome, dados: enc.encode(txt) });
+  return zipSemCompressao([
+    arq("[Content_Types].xml", `${X}<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>`),
+    arq("_rels/.rels", `${X}<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="${REL}/officeDocument" Target="xl/workbook.xml"/></Relationships>`),
+    arq("xl/workbook.xml", `${X}<workbook xmlns="${NS}" xmlns:r="${REL}"><sheets><sheet name="Relatorio" sheetId="1" r:id="rId1"/></sheets></workbook>`),
+    arq("xl/_rels/workbook.xml.rels", `${X}<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="${REL}/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="${REL}/styles" Target="styles.xml"/></Relationships>`),
+    arq("xl/styles.xml", `${X}<styleSheet xmlns="${NS}"><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="1" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>`),
+    arq("xl/worksheets/sheet1.xml", `${X}<worksheet xmlns="${NS}"><cols><col min="1" max="1" width="20" customWidth="1"/><col min="2" max="${cabecalho.length}" width="16" customWidth="1"/></cols><sheetData>${cab}${corpo}</sheetData></worksheet>`),
+  ]);
+}
+
+const RELATORIO_CABECALHO = ["Identificacao", "Farmaco", "Dose", "Motivo", "Data", "Lote", "Modalidade", "Aplicador", "Protocolo", "Temperatura", "CurralDestino"];
+const RELATORIO_TIPOS = ["num0", "txt", "numtxt", "txt", "txt", "numtxt", "txt", "txt", "txt", "numtxt", "txt"];
+const XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+
+// Uma linha por medicamento aplicado. SISBOV só com dígitos (número).
+function linhasRelatorio(lancamentos) {
+  const linhas = [];
+  lancamentos
+    .slice()
+    .sort((a, b) => (a.data || "").localeCompare(b.data || ""))
+    .forEach((l) => {
+      const meds = l.medicamentos && l.medicamentos.length > 0 ? l.medicamentos : [{ medicamento: "", ml: "", lote: "" }];
+      meds.forEach((m) => {
+        linhas.push([
+          String(l.sisbov == null ? "" : l.sisbov).replace(/\D/g, ""),
+          m.medicamento, m.ml, l.motivo, fmtDate(l.data), m.lote, l.modalidade, l.responsavel, l.protocolo, l.temperatura, l.destino,
+        ]);
+      });
+    });
+  return linhas;
+}
+
+async function shareOrDownloadBlob(filename, blob) {
+  try {
+    if (navigator.canShare && navigator.share) {
+      const file = new File([blob], filename, { type: blob.type });
+      if (navigator.canShare({ files: [file] })) {
+        await navigator.share({ files: [file], title: filename });
+        return { ok: true, method: "share" };
+      }
+    }
+  } catch (e) {
+    if (e && e.name === "AbortError") return { ok: true, method: "cancelled" };
+  }
+  try {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+    return { ok: true, method: "download" };
+  } catch (e) {
+    return { ok: false, method: "none" };
+  }
+}
+
 async function shareOrDownloadFile(filename, content, mime = "text/csv;charset=utf-8;") {
   const withBom = "\uFEFF" + content;
 
@@ -1737,45 +2654,68 @@ function EditLancamentoForm({ lancamento, medicamentos, motivos, currais, onSave
   );
 }
 
+// Nome de exibição de um motivo (tira o prefixo dos protocolos sanitários).
+function motivoNome(label) {
+  return label.indexOf(PROTO_PREFIX) === 0 ? label.slice(PROTO_PREFIX.length) : label;
+}
+
+function MotivoRows({ itens, muted }) {
+  return itens.map(([label, count]) => (
+    <div
+      key={label}
+      style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 13, padding: "6px 0", borderBottom: "1px solid #EDEBDD" }}
+    >
+      <span style={{ color: muted ? "#6B6A57" : "#3A3D31", fontWeight: 600 }}>{motivoNome(label)}</span>
+      <span style={{ fontWeight: 800, color: "#2E4A2B" }}>{count.toLocaleString("pt-BR")}x</span>
+    </div>
+  ));
+}
+
+function ProtocoloTitulo() {
+  return (
+    <div style={{ fontSize: 11, fontWeight: 800, color: "#6B6A57", textTransform: "uppercase", letterSpacing: "0.06em", margin: "12px 0 2px" }}>
+      Protocolo sanitário
+    </div>
+  );
+}
+
 // Pesquisa rápida por manejo (mesma lógica da aba Lançar: busca pelos
 // últimos dígitos sem exigir o dígito verificador; se houver mais de um
-// animal com esses dígitos, o usuário escolhe qual).
-function QuickAnimalSearch({ lancamentos }) {
+// animal com esses dígitos, o usuário escolhe qual). Junta os lançamentos do
+// app com o histórico de sanidade importado.
+function QuickAnimalSearch({ lancamentos, sanidade }) {
   const [query, setQuery] = useState("");
   const [selectedSisbov, setSelectedSisbov] = useState(null);
   const [show, setShow] = useState(false);
 
   const digits = query.replace(/\D/g, "");
+  const histKeys = useMemo(() => (sanidade ? Object.keys(sanidade.byAnimal) : []), [sanidade]);
 
   const matches = useMemo(() => {
     if (digits.length < 5) return [];
+    const test = (s) => (digits.length >= 15 ? s === digits : s.endsWith(digits));
     const found = [];
     const seen = new Set();
     lancamentos.forEach((l) => {
-      if (!l.sisbov || seen.has(l.sisbov)) return;
-      const isMatch = digits.length >= 15 ? l.sisbov === digits : l.sisbov.endsWith(digits);
-      if (isMatch) {
+      if (l.sisbov && !seen.has(l.sisbov) && test(l.sisbov)) {
         seen.add(l.sisbov);
         found.push(l.sisbov);
       }
     });
+    histKeys.forEach((s) => {
+      if (!seen.has(s) && test(s)) {
+        seen.add(s);
+        found.push(s);
+      }
+    });
     return found;
-  }, [lancamentos, digits]);
+  }, [lancamentos, histKeys, digits]);
 
   const effectiveSisbov = matches.length === 1 ? matches[0] : selectedSisbov;
-
-  const stats = useMemo(() => {
-    if (!effectiveSisbov) return null;
-    const registros = lancamentos.filter((l) => l.sisbov === effectiveSisbov);
-    const porMotivo = {};
-    registros.forEach((l) => {
-      const m = l.motivo || "SEM MOTIVO";
-      porMotivo[m] = (porMotivo[m] || 0) + 1;
-    });
-    const motivosOrdenados = Object.entries(porMotivo).sort((a, b) => b[1] - a[1]);
-    const ultima = registros.slice().sort((a, b) => (b.data || "").localeCompare(a.data || ""))[0];
-    return { total: registros.length, motivosOrdenados, ultima };
-  }, [lancamentos, effectiveSisbov]);
+  const stats = useMemo(
+    () => (effectiveSisbov ? computeAnimalStats(effectiveSisbov, lancamentos, sanidade) : null),
+    [lancamentos, sanidade, effectiveSisbov]
+  );
 
   return (
     <Card style={{ marginBottom: 14 }}>
@@ -1791,10 +2731,10 @@ function QuickAnimalSearch({ lancamentos }) {
 
       {show && (
         <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid #EDEBDD" }}>
-          <Field label="Número de manejo" hint="Sem o dígito verificador — se houver mais de um animal, você escolhe qual">
+          <Field label="Número de manejo" hint="Com o dígito verificador (último número) — se houver mais de um animal, você escolhe qual">
             <TextInput
               inputMode="numeric"
-              placeholder="Ex: 674745"
+              placeholder="Ex: 6747453"
               value={query}
               onChange={(e) => {
                 setQuery(e.target.value.replace(/[^\d]/g, ""));
@@ -1804,15 +2744,16 @@ function QuickAnimalSearch({ lancamentos }) {
           </Field>
 
           {digits.length >= 5 && matches.length === 0 && (
-            <div style={{ fontSize: 12.5, color: "#A9A791" }}>Nenhum lançamento encontrado para esse número.</div>
+            <div style={{ fontSize: 12.5, color: "#A9A791" }}>Nenhuma medicação encontrada para esse número.</div>
           )}
 
           {matches.length > 1 && (
             <div style={{ marginBottom: 4 }}>
               <div style={{ fontSize: 12, color: "#B5442E", fontWeight: 700, marginBottom: 6, display: "flex", alignItems: "center", gap: 5 }}>
-                <AlertCircle size={13} /> {matches.length} animais encontrados com esses números. Escolha qual:
+                <AlertCircle size={13} /> {matches.length} animais encontrados com esses números.{" "}
+                {matches.length > 30 ? "Mostrando 30 — digite mais números. " : ""}Escolha qual:
               </div>
-              {matches.map((s) => (
+              {matches.slice(0, 30).map((s) => (
                 <button
                   key={s}
                   type="button"
@@ -1840,24 +2781,22 @@ function QuickAnimalSearch({ lancamentos }) {
 
           {stats && (
             <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px solid #EDEBDD" }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4, flexWrap: "wrap" }}>
                 <EarTag>{effectiveSisbov}</EarTag>
                 <span style={{ fontWeight: 800, fontSize: 14, color: "#20241A" }}>
-                  {stats.total} medicação{stats.total === 1 ? "" : "ões"} registrada{stats.total === 1 ? "" : "s"}
+                  {stats.total.toLocaleString("pt-BR")} {stats.total === 1 ? "medicação registrada" : "medicações registradas"}
                 </span>
               </div>
-              {stats.motivosOrdenados.map(([motivo, count]) => (
-                <div
-                  key={motivo}
-                  style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 13, padding: "6px 0", borderBottom: "1px solid #EDEBDD" }}
-                >
-                  <span style={{ color: "#3A3D31", fontWeight: 600 }}>{motivo}</span>
-                  <span style={{ fontWeight: 800, color: "#2E4A2B" }}>{count}x</span>
-                </div>
-              ))}
-              {stats.ultima && (
+              <div style={{ fontSize: 11.5, color: "#9C9A88", marginBottom: 8 }}>
+                {stats.nTrat} tratamento{stats.nTrat === 1 ? "" : "s"} · {stats.nProt} de protocolo sanitário
+                {stats.nHist > 0 ? ` · ${stats.nHist} vinda${stats.nHist === 1 ? "" : "s"} do histórico importado` : ""}
+              </div>
+              <MotivoRows itens={stats.tratamentos} />
+              {stats.protocolos.length > 0 && <ProtocoloTitulo />}
+              <MotivoRows itens={stats.protocolos} muted />
+              {stats.ultimo && (
                 <div style={{ fontSize: 11.5, color: "#9C9A88", marginTop: 8 }}>
-                  Última medicação em {fmtDate(stats.ultima.data)} · {stats.ultima.motivo}
+                  Última aplicação em {fmtDate(stats.ultimo.iso)} · {motivoNome(stats.ultimo.motivo)}
                 </div>
               )}
             </div>
@@ -1868,7 +2807,96 @@ function QuickAnimalSearch({ lancamentos }) {
   );
 }
 
-function HistoricoTab({ lancamentos, onDelete, onUpdate, medicamentos, motivos, currais }) {
+// Relatório por medicamento: escolhe um medicamento e vê quantas vezes foi
+// usado e por quais motivos (lançamentos do app + histórico de sanidade).
+function MedicamentoReport({ lancamentos, medicamentos, sanidade }) {
+  const [selecionado, setSelecionado] = useState(""); // nome normalizado
+  const [show, setShow] = useState(false);
+
+  const options = useMemo(() => {
+    const map = new Map();
+    medicamentos.forEach((m) => {
+      const k = normKey(m.nome);
+      if (!map.has(k)) map.set(k, m.nome);
+    });
+    if (sanidade) {
+      sanidade.meta.farmacos.forEach((f) => {
+        const k = normKey(f);
+        if (!map.has(k)) map.set(k, f);
+      });
+    }
+    return Array.from(map.entries())
+      .map(([key, nome]) => ({ key, nome }))
+      .sort((a, b) => a.nome.localeCompare(b.nome, "pt-BR"));
+  }, [medicamentos, sanidade]);
+
+  const stats = useMemo(
+    () => (selecionado ? computeMedStats(selecionado, lancamentos, sanidade) : null),
+    [selecionado, lancamentos, sanidade]
+  );
+
+  return (
+    <Card style={{ marginBottom: 14 }}>
+      <div
+        style={{ display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer" }}
+        onClick={() => setShow(!show)}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 700, fontSize: 14 }}>
+          <Syringe size={16} color="#2E4A2B" /> Relatório por medicamento
+        </div>
+        {show ? <ChevronUp size={16} color="#9C9A88" /> : <ChevronDown size={16} color="#9C9A88" />}
+      </div>
+
+      {show && (
+        <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid #EDEBDD" }}>
+          <Field label="Medicamento">
+            <Select value={selecionado} onChange={(e) => setSelecionado(e.target.value)}>
+              <option value="">Selecione…</option>
+              {options.map((o) => (
+                <option key={o.key} value={o.key}>
+                  {o.nome}
+                </option>
+              ))}
+            </Select>
+          </Field>
+
+          {stats && (
+            <div style={{ marginTop: 6 }}>
+              <div style={{ fontWeight: 800, fontSize: 14, color: "#20241A", marginBottom: 4 }}>
+                {stats.total.toLocaleString("pt-BR")} {stats.total === 1 ? "aplicação registrada" : "aplicações registradas"}
+              </div>
+              {stats.nHist > 0 && (
+                <div style={{ fontSize: 11.5, color: "#9C9A88", marginBottom: 8 }}>
+                  {stats.nLive.toLocaleString("pt-BR")} lançadas no app · {stats.nHist.toLocaleString("pt-BR")} do histórico importado
+                </div>
+              )}
+              {stats.total === 0 && (
+                <div style={{ fontSize: 12.5, color: "#A9A791" }}>Nenhum lançamento encontrado com esse medicamento.</div>
+              )}
+              <MotivoRows itens={stats.tratamentos} />
+              {stats.protocolos.length > 0 && <ProtocoloTitulo />}
+              <MotivoRows itens={stats.protocolos} muted />
+            </div>
+          )}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+const linkBtnStyle = {
+  background: "transparent",
+  border: "none",
+  color: "#2E4A2B",
+  fontWeight: 800,
+  fontSize: 12,
+  cursor: "pointer",
+  padding: "4px 0",
+  textDecoration: "underline",
+  fontFamily: "inherit",
+};
+
+function HistoricoTab({ lancamentos, onDelete, onUpdate, medicamentos, motivos, currais, sanidade, onMarkExported }) {
   const [q, setQ] = useState("");
   const [expanded, setExpanded] = useState(null);
   const [editingId, setEditingId] = useState(null);
@@ -1879,69 +2907,126 @@ function HistoricoTab({ lancamentos, onDelete, onUpdate, medicamentos, motivos, 
   const [showExport, setShowExport] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [fallbackCsv, setFallbackCsv] = useState("");
+  const [incluirExportados, setIncluirExportados] = useState(false);
+  const [marcarAoExportar, setMarcarAoExportar] = useState(true);
+  const [filtroExp, setFiltroExp] = useState("todos");
+  const [confirmUndo, setConfirmUndo] = useState(false);
+  const [confirmMarcar, setConfirmMarcar] = useState(false);
 
   const inRange = useMemo(() => {
     if (!startDate || !endDate) return [];
     return lancamentos.filter((l) => l.data && l.data >= startDate && l.data <= endDate);
   }, [lancamentos, startDate, endDate]);
 
-  const handleExport = async () => {
+  const novosNoPeriodo = useMemo(() => inRange.filter((l) => !l.exportadoEm), [inRange]);
+  const jaExportadosNoPeriodo = inRange.length - novosNoPeriodo.length;
+  const paraExportar = incluirExportados ? inRange : novosNoPeriodo;
+  const totalNovos = useMemo(() => lancamentos.filter((l) => !l.exportadoEm).length, [lancamentos]);
+  const ultimaExportacao = useMemo(() => {
+    let lote = 0;
+    lancamentos.forEach((l) => {
+      if (l.exportadoEm && l.exportLote && l.exportLote > lote) lote = l.exportLote;
+    });
+    if (!lote) return null;
+    return { lote, ids: lancamentos.filter((l) => l.exportadoEm && l.exportLote === lote).map((l) => l.id) };
+  }, [lancamentos]);
+
+  // Depois de exportar com sucesso, marca os lançamentos novos como "já lançados no sistema".
+  // Retorna: null (não exportou/cancelou), 0 (nada a marcar), -1 (falhou ao marcar) ou quantos marcou.
+  const concluirExportacao = async (result) => {
+    if (!result.ok || result.method === "cancelled") return null;
+    if (!marcarAoExportar) return 0;
+    const ids = paraExportar.filter((l) => !l.exportadoEm).map((l) => l.id);
+    if (!ids.length) return 0;
+    const ok = await onMarkExported(ids, Date.now());
+    return ok ? ids.length : -1;
+  };
+  const textoMarcados = (n) =>
+    n > 0 ? ` ${n} marcado(s) como já lançado(s) no sistema.` : n === -1 ? " (não consegui marcar como lançados — tente marcar manualmente)." : "";
+
+  const handleExport = async (formato) => {
     if (inRange.length === 0) {
       setExportMsg("Nenhum lançamento encontrado nesse período.");
       return;
     }
+    if (paraExportar.length === 0) {
+      setExportMsg('Todos os lançamentos desse período já foram exportados. Marque "Incluir também os já exportados" para exportar de novo.');
+      return;
+    }
     setExportMsg("");
     setFallbackCsv("");
-    const header = ["Identificacao", "Farmaco", "Dose", "Motivo", "Data", "Lote", "Modalidade", "Aplicador", "Protocolo", "Temperatura"];
-    const lines = [header.join(";")];
-    inRange
-      .slice()
-      .sort((a, b) => (a.data || "").localeCompare(b.data || ""))
-      .forEach((l) => {
-        const meds = l.medicamentos && l.medicamentos.length > 0 ? l.medicamentos : [{ medicamento: "", ml: "", lote: "" }];
-        meds.forEach((m) => {
-          const row = [
-            l.sisbov,
-            m.medicamento,
-            m.ml,
-            l.motivo,
-            fmtDate(l.data),
-            m.lote,
-            l.modalidade,
-            l.responsavel,
-            l.protocolo,
-            l.temperatura,
-          ];
-          lines.push(row.map(csvEscapeSemi).join(";"));
-        });
-      });
+    const linhas = linhasRelatorio(paraExportar);
     setExporting(true);
+    const nomeBase = `relatorio_medicacao_${startDate}_a_${endDate}`;
+    if (formato === "xlsx") {
+      let result;
+      try {
+        const bytes = montarXlsx(RELATORIO_CABECALHO, linhas, RELATORIO_TIPOS);
+        result = await shareOrDownloadBlob(`${nomeBase}.xlsx`, new Blob([bytes], { type: XLSX_MIME }));
+      } catch (e) {
+        console.error("Erro ao gerar o Excel:", e);
+        result = { ok: false };
+      }
+      const marcados = await concluirExportacao(result);
+      setExporting(false);
+      setExportMsg(
+        result.ok
+          ? result.method === "cancelled"
+            ? "Envio cancelado — nada foi marcado como exportado."
+            : `${paraExportar.length} lançamento(s) exportado(s) em Excel.${textoMarcados(marcados)}`
+          : "Não deu para gerar o Excel neste navegador. Use o botão CSV."
+      );
+      return;
+    }
+    const lines = [RELATORIO_CABECALHO.join(";")].concat(linhas.map((r) => r.map(csvEscapeSemi).join(";")));
     const csvContent = lines.join("\r\n");
-    const result = await shareOrDownloadFile(`relatorio_medicacao_${startDate}_a_${endDate}.csv`, csvContent);
+    const result = await shareOrDownloadFile(`${nomeBase}.csv`, csvContent);
+    const marcados = await concluirExportacao(result);
     setExporting(false);
     if (result.ok) {
-      setExportMsg(result.method === "cancelled" ? "Envio cancelado." : `${inRange.length} lançamento(s) exportado(s).`);
+      setExportMsg(
+        result.method === "cancelled"
+          ? "Envio cancelado — nada foi marcado como exportado."
+          : `${paraExportar.length} lançamento(s) exportado(s).${textoMarcados(marcados)}`
+      );
     } else {
-      setExportMsg("Não deu para baixar automaticamente neste navegador. Copie o texto abaixo:");
+      setExportMsg("Não deu para baixar automaticamente neste navegador. Copie o texto abaixo (os lançamentos NÃO foram marcados como exportados):");
       setFallbackCsv(csvContent);
     }
   };
 
+  const desfazerUltima = async () => {
+    if (!ultimaExportacao) return;
+    const n = ultimaExportacao.ids.length;
+    const ok = await onMarkExported(ultimaExportacao.ids, null, true);
+    setConfirmUndo(false);
+    setExportMsg(ok ? `Exportação desfeita: ${n} lançamento(s) voltaram a "novo".` : "Não consegui desfazer. Tente de novo.");
+  };
+  const marcarPeriodoSemExportar = async () => {
+    const ids = novosNoPeriodo.map((l) => l.id);
+    const ok = await onMarkExported(ids, Date.now());
+    setConfirmMarcar(false);
+    setExportMsg(ok ? `${ids.length} lançamento(s) marcados como já lançados no sistema (sem exportar).` : "Não consegui marcar. Tente de novo.");
+  };
+
   const filtered = useMemo(() => {
-    if (!q.trim()) return lancamentos;
+    const base =
+      filtroExp === "novos" ? lancamentos.filter((l) => !l.exportadoEm) : filtroExp === "exportados" ? lancamentos.filter((l) => l.exportadoEm) : lancamentos;
+    if (!q.trim()) return base;
     const t = q.trim().toLowerCase();
-    return lancamentos.filter(
+    return base.filter(
       (l) =>
         l.sisbov?.includes(t) ||
         l.motivo?.toLowerCase().includes(t) ||
         l.responsavel?.toLowerCase().includes(t) ||
         l.medicamentos?.some((m) => m.medicamento.toLowerCase().includes(t))
     );
-  }, [lancamentos, q]);
+  }, [lancamentos, q, filtroExp]);
 
   return (
     <div>
-      <QuickAnimalSearch lancamentos={lancamentos} />
+      <QuickAnimalSearch lancamentos={lancamentos} sanidade={sanidade} />
+      <MedicamentoReport lancamentos={lancamentos} medicamentos={medicamentos} sanidade={sanidade} />
 
       <Card style={{ marginBottom: 14 }}>
         <div
@@ -1967,13 +3052,70 @@ function HistoricoTab({ lancamentos, onDelete, onUpdate, medicamentos, motivos, 
                 </Field>
               </div>
             </div>
-            <div style={{ fontSize: 12, color: "#6B6A57", marginBottom: 10 }}>
-              {inRange.length} lançamento(s) encontrado(s) no período.
+            <div style={{ fontSize: 12, color: "#6B6A57", marginBottom: 8 }}>
+              {inRange.length} no período · <strong>{novosNoPeriodo.length} novo(s)</strong> (ainda não lançados no sistema) · {jaExportadosNoPeriodo} já exportado(s)
             </div>
-            <Btn onClick={handleExport} disabled={exporting} style={{ width: "100%" }}>
-              {exporting ? <Loader2 size={15} style={{ animation: "spin 1s linear infinite" }} /> : <FileDown size={15} />}
-              {exporting ? "Gerando…" : "Extrair CSV"}
-            </Btn>
+            <label style={{ display: "flex", alignItems: "flex-start", gap: 8, fontSize: 12.5, color: "#3A3D31", marginBottom: 6 }}>
+              <input type="checkbox" checked={marcarAoExportar} onChange={(e) => setMarcarAoExportar(e.target.checked)} style={{ marginTop: 2 }} />
+              <span>Marcar como "já lançados no sistema" ao exportar</span>
+            </label>
+            <label style={{ display: "flex", alignItems: "flex-start", gap: 8, fontSize: 12.5, color: "#3A3D31", marginBottom: 6 }}>
+              <input type="checkbox" checked={incluirExportados} onChange={(e) => setIncluirExportados(e.target.checked)} style={{ marginTop: 2 }} />
+              <span>Incluir também os já exportados (exportar de novo)</span>
+            </label>
+            <div style={{ fontSize: 12, color: "#2E4A2B", fontWeight: 700, marginBottom: 10 }}>
+              Vai exportar {paraExportar.length} lançamento(s).
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <Btn onClick={() => handleExport("csv")} disabled={exporting} style={{ flex: 1 }}>
+                {exporting ? <Loader2 size={15} style={{ animation: "spin 1s linear infinite" }} /> : <FileDown size={15} />}
+                {exporting ? "Gerando…" : "Extrair CSV"}
+              </Btn>
+              <Btn variant="accent" onClick={() => handleExport("xlsx")} disabled={exporting} style={{ flex: 1 }}>
+                <FileDown size={15} /> Extrair Excel
+              </Btn>
+            </div>
+            <div style={{ fontSize: 11.5, color: "#9C9A88", marginTop: 6 }}>
+              O relatório traz o curral de destino depois da temperatura. No Excel (.xlsx) o SISBOV sai como número inteiro; no CSV ele vai só com dígitos, e o Excel costuma mostrá-lo em notação científica.
+            </div>
+            <div style={{ borderTop: "1px solid #EDEBDD", marginTop: 12, paddingTop: 8 }}>
+              {ultimaExportacao && (
+                <div style={{ fontSize: 12, color: "#4A4E3F", marginBottom: 4 }}>
+                  Última exportação: <strong>{fmtDateTime(ultimaExportacao.lote)}</strong> ({ultimaExportacao.ids.length} lançamento(s)).{" "}
+                  {!confirmUndo ? (
+                    <button type="button" onClick={() => setConfirmUndo(true)} style={linkBtnStyle}>
+                      Desfazer
+                    </button>
+                  ) : (
+                    <span>
+                      Voltar esses {ultimaExportacao.ids.length} para "novo"?{" "}
+                      <button type="button" onClick={desfazerUltima} style={{ ...linkBtnStyle, color: "#B5442E" }}>
+                        Sim, desfazer
+                      </button>{" "}
+                      <button type="button" onClick={() => setConfirmUndo(false)} style={linkBtnStyle}>
+                        Não
+                      </button>
+                    </span>
+                  )}
+                </div>
+              )}
+              {novosNoPeriodo.length > 0 &&
+                (!confirmMarcar ? (
+                  <button type="button" onClick={() => setConfirmMarcar(true)} style={linkBtnStyle}>
+                    Só marcar os {novosNoPeriodo.length} novos do período como já lançados (sem exportar)
+                  </button>
+                ) : (
+                  <div style={{ fontSize: 12, color: "#4A4E3F" }}>
+                    Marcar {novosNoPeriodo.length} lançamento(s) como já lançados no sistema?{" "}
+                    <button type="button" onClick={marcarPeriodoSemExportar} style={{ ...linkBtnStyle, color: "#B5442E" }}>
+                      Sim, marcar
+                    </button>{" "}
+                    <button type="button" onClick={() => setConfirmMarcar(false)} style={linkBtnStyle}>
+                      Não
+                    </button>
+                  </div>
+                ))}
+            </div>
             {exportMsg && (
               <div style={{ fontSize: 12, color: fallbackCsv ? "#B5442E" : "#2E4A2B", marginTop: 8, display: "flex", alignItems: "center", gap: 6 }}>
                 {fallbackCsv ? <AlertCircle size={13} /> : <Check size={13} />} {exportMsg}
@@ -1995,6 +3137,33 @@ function HistoricoTab({ lancamentos, onDelete, onUpdate, medicamentos, motivos, 
           </div>
         )}
       </Card>
+
+      <div style={{ display: "flex", gap: 6, marginBottom: 10, flexWrap: "wrap" }}>
+        {[
+          ["todos", `Todos (${lancamentos.length})`],
+          ["novos", `Novos (${totalNovos})`],
+          ["exportados", `Já exportados (${lancamentos.length - totalNovos})`],
+        ].map(([k, rot]) => (
+          <button
+            key={k}
+            type="button"
+            onClick={() => setFiltroExp(k)}
+            style={{
+              background: filtroExp === k ? "#2E4A2B" : "#FFFFFF",
+              color: filtroExp === k ? "#F3F4EC" : "#4A4E3F",
+              border: "1.5px solid " + (filtroExp === k ? "#2E4A2B" : "#D7D5C4"),
+              borderRadius: 999,
+              padding: "6px 12px",
+              fontSize: 12.5,
+              fontWeight: 700,
+              cursor: "pointer",
+              fontFamily: "inherit",
+            }}
+          >
+            {rot}
+          </button>
+        ))}
+      </div>
 
       <div style={{ position: "relative", marginBottom: 14 }}>
         <Search size={16} style={{ position: "absolute", left: 12, top: 13, color: "#9C9A88" }} />
@@ -2024,6 +3193,18 @@ function HistoricoTab({ lancamentos, onDelete, onUpdate, medicamentos, motivos, 
                 <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
                   <EarTag>{l.sisbov}</EarTag>
                   <span style={{ fontSize: 12.5, color: "#6B6A57", fontWeight: 700 }}>{l.motivo}</span>
+                  <span
+                    style={{
+                      fontSize: 11,
+                      fontWeight: 800,
+                      color: l.exportadoEm ? "#2E4A2B" : "#A06A00",
+                      background: l.exportadoEm ? "#EAF3DE" : "#FBF3E0",
+                      borderRadius: 6,
+                      padding: "2px 7px",
+                    }}
+                  >
+                    {l.exportadoEm ? "✓ exportado" : "novo"}
+                  </span>
                 </div>
                 <div style={{ fontSize: 13, color: "#3A3D31" }}>
                   {l.medicamentos?.map((m, i) => (
@@ -2061,6 +3242,19 @@ function HistoricoTab({ lancamentos, onDelete, onUpdate, medicamentos, motivos, 
                 <Row icon={<User size={14} />} label="Responsável" value={l.responsavel} />
                 {l.observacao && <Row icon={<MessageSquare size={14} />} label="Observação" value={l.observacao} />}
                 <div style={{ fontSize: 11.5, color: "#A9A791", marginTop: 8 }}>Registrado em {fmtDateTime(l.dataRegistro)}</div>
+                <div style={{ fontSize: 11.5, color: l.exportadoEm ? "#2E4A2B" : "#A06A00", marginTop: 4, fontWeight: 700 }}>
+                  {l.exportadoEm ? `Exportado em ${fmtDateTime(l.exportadoEm)}` : "Ainda não exportado para o sistema"}
+                </div>
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onMarkExported([l.id], l.exportadoEm ? null : Date.now(), true);
+                  }}
+                  style={linkBtnStyle}
+                >
+                  {l.exportadoEm ? "Marcar como não exportado" : "Marcar como já exportado"}
+                </button>
 
                 {confirmDeleteId !== l.id ? (
                   <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
@@ -2222,6 +3416,44 @@ function AddRow({ placeholder, onAdd }) {
   );
 }
 
+function fonteTexto(f) {
+  if (!f) return "";
+  if (f.origem === "aparelho") return `Fonte: arquivo carregado neste aparelho (${f.arquivo})`;
+  return `Fonte: ${f.arquivo} do site · ${mb(f.bytes || 0)} MB`;
+}
+
+function BancoLinha({ titulo, resumo, atualizado, erro, loading, fonte, tentativas }) {
+  return (
+    <div style={{ padding: "8px 0", borderBottom: "1px solid #EDEBDD" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+        <span style={{ fontWeight: 700, fontSize: 14 }}>{titulo}</span>
+        {loading && <Loader2 size={14} style={{ animation: "spin 1s linear infinite" }} />}
+      </div>
+      {erro ? (
+        <div style={{ display: "flex", alignItems: "flex-start", gap: 6, color: "#B5442E", fontSize: 12.5, marginTop: 2 }}>
+          <AlertCircle size={14} /> <span>{erro}</span>
+        </div>
+      ) : (
+        <>
+          <div style={{ fontSize: 12.5, color: "#3A3D31" }}>{resumo || (loading ? "Carregando…" : "—")}</div>
+          {atualizado && <div style={{ fontSize: 11.5, color: "#9C9A88" }}>Atualizado em {fmtDateTime(atualizado)}</div>}
+        </>
+      )}
+      {fonte && <div style={{ fontSize: 11, color: "#A9A791" }}>{fonte}</div>}
+      {tentativas && tentativas.length > 0 && (
+        <details open={!!erro} style={{ marginTop: 4 }}>
+          <summary style={{ fontSize: 11.5, color: "#6B6A57", cursor: "pointer", fontWeight: 700 }}>Detalhes da busca</summary>
+          {tentativas.map((t, i) => (
+            <div key={i} style={{ fontSize: 11.5, color: "#6B6A57", wordBreak: "break-word" }}>
+              {t.arquivo} → {t.resultado}
+            </div>
+          ))}
+        </details>
+      )}
+    </div>
+  );
+}
+
 function CadastrosTab({
   medicamentos,
   motivos,
@@ -2235,10 +3467,15 @@ function CadastrosTab({
   addCurral,
   removeCurral,
   animaisCount,
-  animaisSyncing,
   animaisUpdatedAt,
-  onRefreshAnimais,
-  onImportAnimais,
+  sanidade,
+  datasetsLoading,
+  datasetsStatus,
+  datasetErrors,
+  datasetInfo,
+  onReloadDatasets,
+  onLoadLocalFiles,
+  onClearLocalFiles,
   usuarios,
   addUsuario,
   removeUsuario,
@@ -2249,74 +3486,7 @@ function CadastrosTab({
   const [novoUsuarioNome, setNovoUsuarioNome] = useState("");
   const [novoUsuarioSenha, setNovoUsuarioSenha] = useState("");
   const [usuarioError, setUsuarioError] = useState("");
-  const [showImport, setShowImport] = useState(false);
-  const [pasteText, setPasteText] = useState("");
-  const [importError, setImportError] = useState("");
-  const [fileName, setFileName] = useState("");
-  const [fileLineCount, setFileLineCount] = useState(0);
-  const fileContentRef = React.useRef("");
-  const fileInputRef = React.useRef(null);
-
-  const [quickError, setQuickError] = useState("");
-  const quickFileInputRef = React.useRef(null);
-
-  const handleQuickFile = (file) => {
-    if (!file) return;
-    setQuickError("");
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      const text = String(e.target.result || "");
-      const { rows, error } = parseAnimaisCsv(text);
-      if (error) {
-        setQuickError(error);
-        return;
-      }
-      onImportAnimais(rows);
-    };
-    reader.onerror = () => setQuickError("Não consegui ler o arquivo. Tente novamente.");
-    reader.readAsText(file, "utf-8");
-    if (quickFileInputRef.current) quickFileInputRef.current.value = "";
-  };
-
-  const handleFile = (file) => {
-    if (!file) return;
-    setImportError("");
-    setPasteText("");
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      const text = String(e.target.result || "");
-      fileContentRef.current = text;
-      setFileName(file.name);
-      setFileLineCount(text.split(/\r\n|\n|\r/).filter((l) => l.trim().length > 0).length);
-    };
-    reader.onerror = () => setImportError("Não consegui ler o arquivo. Tente novamente.");
-    reader.readAsText(file, "utf-8");
-  };
-
-  const clearFile = () => {
-    fileContentRef.current = "";
-    setFileName("");
-    setFileLineCount(0);
-    if (fileInputRef.current) fileInputRef.current.value = "";
-  };
-
-  const handleImport = () => {
-    setImportError("");
-    const text = fileName ? fileContentRef.current : pasteText;
-    if (!text.trim()) {
-      setImportError("Cole o texto ou selecione um arquivo CSV com ao menos uma linha.");
-      return;
-    }
-    const { rows, error } = parseAnimaisCsv(text);
-    if (error) {
-      setImportError(error);
-      return;
-    }
-    onImportAnimais(rows);
-    setPasteText("");
-    clearFile();
-    setShowImport(false);
-  };
+  const localInputRef = React.useRef(null);
 
   const handleAddUsuario = () => {
     setUsuarioError("");
@@ -2446,172 +3616,91 @@ function CadastrosTab({
         {currais.length === 0 && <EmptyHint>Nenhum curral cadastrado.</EmptyHint>}
       </div>
 
-      <SectionTitle>Banco de dados de SISBOV</SectionTitle>
+      <SectionTitle>Banco de dados (arquivos do site)</SectionTitle>
       <Card style={{ marginBottom: 8 }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
-          <div>
-            <div style={{ fontWeight: 700, fontSize: 14 }}>
-              {animaisCount === null ? "—" : animaisCount} animal(is) cadastrado(s)
-            </div>
-            {animaisUpdatedAt && (
-              <div style={{ fontSize: 11.5, color: "#9C9A88", marginTop: 2 }}>Atualizado em {fmtDateTime(animaisUpdatedAt)}</div>
-            )}
-          </div>
-          <Btn variant="ghost" onClick={onRefreshAnimais} disabled={animaisSyncing}>
-            {animaisSyncing ? <Loader2 size={15} style={{ animation: "spin 1s linear infinite" }} /> : <RefreshCw size={15} />}
-            Atualizar
-          </Btn>
-        </div>
-
-        <input
-          ref={quickFileInputRef}
-          type="file"
-          accept=".csv,text/csv,text/plain"
-          onChange={(e) => handleQuickFile(e.target.files?.[0])}
-          style={{ display: "none" }}
+        <BancoLinha
+          titulo="Animais (SISBOV)"
+          loading={datasetsLoading}
+          erro={datasetErrors && datasetErrors.animais}
+          resumo={animaisCount > 0 ? `${animaisCount.toLocaleString("pt-BR")} animais` : ""}
+          atualizado={animaisUpdatedAt}
+          fonte={fonteTexto(datasetInfo && datasetInfo.fontes && datasetInfo.fontes.animais)}
+          tentativas={datasetInfo && datasetInfo.diag && datasetInfo.diag.animais}
         />
-        <Btn
-          variant="accent"
-          onClick={() => quickFileInputRef.current?.click()}
-          disabled={animaisSyncing}
-          style={{ width: "100%", marginTop: 10 }}
-        >
-          {animaisSyncing ? <Loader2 size={15} style={{ animation: "spin 1s linear infinite" }} /> : <FileUp size={15} />}
-          Extrair e atualizar via planilha CSV
-        </Btn>
-        <div style={{ fontSize: 11.5, color: "#9C9A88", marginTop: 6, textAlign: "center" }}>
-          Envia a planilha completa da fazenda e já extrai a coluna 4 (sisbov) e a coluna 45 (local atual) automaticamente. Isso <strong>substitui todo o banco de dados</strong> pelo conteúdo do arquivo enviado.
-        </div>
-        {quickError && (
+        <BancoLinha
+          titulo="Histórico de sanidade"
+          loading={datasetsLoading}
+          erro={datasetErrors && datasetErrors.sanidade}
+          resumo={
+            sanidade && sanidade.meta
+              ? `${sanidade.meta.events.toLocaleString("pt-BR")} eventos em ${sanidade.meta.animals.toLocaleString("pt-BR")} animais · de ${fmtDate(dayToIso(sanidade.meta.dayMin))} a ${fmtDate(dayToIso(sanidade.meta.dayMax))}`
+              : ""
+          }
+          atualizado={sanidade && sanidade.meta ? sanidade.meta.updatedAt : null}
+          fonte={fonteTexto(datasetInfo && datasetInfo.fontes && datasetInfo.fontes.sanidade)}
+          tentativas={datasetInfo && datasetInfo.diag && datasetInfo.diag.sanidade}
+        />
+        {datasetsLoading && datasetsStatus && <div style={{ fontSize: 12, color: "#6B6A57", fontWeight: 700, marginTop: 8 }}>{datasetsStatus}</div>}
+        {datasetInfo && datasetInfo.contexto && datasetInfo.contexto.protocolo === "file:" && (
+          <div style={{ fontSize: 12, color: "#B5442E", fontWeight: 700, marginTop: 8 }}>
+            O app foi aberto direto do arquivo (file://). Abra pelo endereço do site no Render — assim não dá para baixar o banco.
+          </div>
+        )}
+        {datasetInfo && datasetInfo.contexto && (
+          <div style={{ fontSize: 11, color: "#A9A791", marginTop: 8, wordBreak: "break-all" }}>
+            Endereço do app: {datasetInfo.contexto.origem || "—"} · manifest.json: {datasetInfo.contexto.manifest} · Internet do aparelho: {datasetInfo.contexto.online === false ? "desligada" : "ligada"}
+          </div>
+        )}
+        {datasetInfo && datasetInfo.offline && (
+          <div style={{ fontSize: 12, color: "#B5442E", fontWeight: 700, marginTop: 8 }}>Sem conexão com o site: usando os dados guardados neste aparelho.</div>
+        )}
+        {datasetErrors && datasetErrors.geral && (
           <div style={{ display: "flex", alignItems: "center", gap: 6, color: "#B5442E", fontSize: 12.5, marginTop: 8 }}>
-            <AlertCircle size={14} /> {quickError}
+            <AlertCircle size={14} /> {datasetErrors.geral}
           </div>
         )}
-
-        {!showImport ? (
-          <button
-            onClick={() => setShowImport(true)}
-            style={{
-              background: "transparent",
-              border: "none",
-              color: "#6B6A57",
-              fontSize: 12.5,
-              fontWeight: 700,
-              cursor: "pointer",
-              padding: 0,
-              marginTop: 12,
-              textDecoration: "underline",
-              fontFamily: "inherit",
+        <Btn variant="accent" onClick={onReloadDatasets} disabled={datasetsLoading} style={{ width: "100%", marginTop: 12 }}>
+          {datasetsLoading ? <Loader2 size={15} style={{ animation: "spin 1s linear infinite" }} /> : <RefreshCw size={15} />}
+          {datasetsLoading ? "Carregando…" : "Recarregar dados agora"}
+        </Btn>
+        <details style={{ marginTop: 10 }}>
+          <summary style={{ fontSize: 12.5, color: "#2E4A2B", cursor: "pointer", fontWeight: 800 }}>Como atualizar o banco de dados</summary>
+          <div style={{ fontSize: 12, color: "#4A4E3F", marginTop: 6, lineHeight: 1.5 }}>
+            1. Se o arquivo for grande, compacte: botão direito no arquivo → Enviar para → Pasta compactada (fica <strong>sanidade.zip</strong> e <strong>ANIMAIS_APK.zip</strong>, bem menores).
+            <br />2. No GitHub: Add file → Upload files → envie o .zip (ou o .csv) → Commit changes.
+            <br />3. Espere o Render publicar (no Render, aba Events: "Deploy live").
+            <br />4. Aqui, toque em <strong>Recarregar dados agora</strong>.
+            <br />Se algo falhar, abra "Detalhes da busca" acima: ele mostra o que o app encontrou em cada nome de arquivo.
+          </div>
+        </details>
+        <div style={{ borderTop: "1px solid #EDEBDD", marginTop: 12, paddingTop: 12 }}>
+          <input
+            ref={localInputRef}
+            type="file"
+            multiple
+            accept=".csv,.zip,text/csv,application/zip,application/x-zip-compressed"
+            onChange={(e) => {
+              onLoadLocalFiles(e.target.files);
+              e.target.value = "";
             }}
-          >
-            Ou colar dados manualmente
-          </button>
-        ) : (
-          <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px solid #EDEBDD" }}>
-            <div style={{ fontSize: 12.5, color: "#6B6A57", marginBottom: 8 }}>
-              Aceita a exportação completa do sistema da fazenda (identifica as colunas <strong>sisbov</strong> e <strong>local_atual</strong> automaticamente) ou um arquivo simples de duas colunas: <strong>sisbov, local_atual</strong> por linha. Isso <strong>substitui todo o banco de dados</strong> pelo conteúdo do arquivo enviado.
-            </div>
-
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".csv,text/csv,text/plain"
-              onChange={(e) => handleFile(e.target.files?.[0])}
-              style={{ display: "none" }}
-            />
-
-            {fileName ? (
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  width: "100%",
-                  boxSizing: "border-box",
-                  background: "#F3F4EC",
-                  border: "1.5px solid #C8C6B4",
-                  borderRadius: 10,
-                  padding: "10px 12px",
-                  marginBottom: 10,
-                }}
-              >
-                <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
-                  <FileUp size={16} color="#4A4E3F" />
-                  <div style={{ minWidth: 0 }}>
-                    <div style={{ fontSize: 13, fontWeight: 700, color: "#4A4E3F", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{fileName}</div>
-                    <div style={{ fontSize: 11.5, color: "#9C9A88" }}>{fileLineCount} linha(s) lida(s)</div>
-                  </div>
-                </div>
-                <button
-                  onClick={clearFile}
-                  aria-label="Remover arquivo"
-                  style={{ background: "transparent", border: "none", color: "#9C9A88", cursor: "pointer", flexShrink: 0 }}
-                >
-                  <X size={16} />
-                </button>
-              </div>
-            ) : (
-              <button
-                onClick={() => fileInputRef.current?.click()}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 8,
-                  width: "100%",
-                  boxSizing: "border-box",
-                  background: "#F3F4EC",
-                  border: "1.5px dashed #C8C6B4",
-                  borderRadius: 10,
-                  padding: "12px 14px",
-                  color: "#4A4E3F",
-                  fontSize: 13.5,
-                  fontWeight: 700,
-                  cursor: "pointer",
-                  fontFamily: "inherit",
-                  marginBottom: 10,
-                }}
-              >
-                <FileUp size={16} />
-                Selecionar arquivo CSV
-              </button>
-            )}
-
-            {!fileName && (
-              <>
-                <div style={{ fontSize: 11.5, color: "#A9A791", textAlign: "center", margin: "4px 0 10px" }}>ou cole abaixo</div>
-                <TextArea
-                  placeholder={"105350216250010,EXD-15\n105350216250011,EXD-15"}
-                  value={pasteText}
-                  onChange={(e) => setPasteText(e.target.value)}
-                  style={{ minHeight: 110, marginBottom: 8 }}
-                />
-              </>
-            )}
-
-            {importError && (
-              <div style={{ display: "flex", alignItems: "center", gap: 6, color: "#B5442E", fontSize: 12.5, marginBottom: 8 }}>
-                <AlertCircle size={14} /> {importError}
-              </div>
-            )}
-            <div style={{ display: "flex", gap: 8 }}>
-              <Btn onClick={handleImport} disabled={animaisSyncing} style={{ flex: 1 }}>
-                {animaisSyncing ? <Loader2 size={15} style={{ animation: "spin 1s linear infinite" }} /> : <Check size={15} />}
-                Confirmar importação
-              </Btn>
-              <Btn
-                variant="ghost"
-                onClick={() => {
-                  setShowImport(false);
-                  setPasteText("");
-                  clearFile();
-                  setImportError("");
-                }}
-              >
-                <X size={15} />
-              </Btn>
-            </div>
+            style={{ display: "none" }}
+          />
+          <Btn variant="ghost" onClick={() => localInputRef.current && localInputRef.current.click()} disabled={datasetsLoading} style={{ width: "100%" }}>
+            <FileUp size={15} /> Plano B: carregar arquivo deste aparelho
+          </Btn>
+          <div style={{ fontSize: 11.5, color: "#9C9A88", marginTop: 6, textAlign: "center" }}>
+            Escolha o ANIMAIS_APK e/ou a sanidade (.csv ou .zip) direto do celular/computador. Vale só para este aparelho, não vai para o GitHub nem para a nuvem, e o app reconhece sozinho qual é qual.
           </div>
-        )}
+          {datasetInfo && datasetInfo.fontes && (datasetInfo.fontes.animais?.origem === "aparelho" || datasetInfo.fontes.sanidade?.origem === "aparelho") && (
+            <button
+              type="button"
+              onClick={onClearLocalFiles}
+              style={{ background: "transparent", border: "none", color: "#B5442E", fontWeight: 800, fontSize: 12.5, cursor: "pointer", padding: "8px 0 0", width: "100%", fontFamily: "inherit" }}
+            >
+              Voltar a usar só os arquivos do site
+            </button>
+          )}
+        </div>
       </Card>
 
       <SectionTitle>Usuários responsáveis</SectionTitle>
